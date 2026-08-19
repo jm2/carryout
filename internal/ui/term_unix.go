@@ -18,5 +18,6 @@ func termWidth(f *os.File) (int, bool) {
 	return int(ws.Col), errno == 0 && ws.Col > 0
 }
 
-// enableVT is a no-op on unix terminals, which speak ANSI natively.
-func enableVT(f *os.File) bool { return true }
+// enableVT is a no-op on unix terminals, which speak ANSI natively. The
+// returned restore func is likewise a no-op.
+func enableVT(f *os.File) (func(), bool) { return func() {}, true }

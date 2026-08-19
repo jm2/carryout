@@ -41,11 +41,12 @@ type Renderer struct {
 	lastFrame string
 	lastW     int
 
-	snap    func() fetch.Snapshot
-	started bool
-	stop    chan struct{}
-	done    chan struct{}
-	closed  sync.Once
+	snap      func() fetch.Snapshot
+	started   bool
+	stop      chan struct{}
+	done      chan struct{}
+	closed    sync.Once
+	restoreVT func() // undo enableVT's console-mode change (Windows)
 
 	// speed tracking (EMA, τ ≈ 4s)
 	lastSample time.Time
@@ -78,13 +79,17 @@ func NewLive(out *os.File, tty bool) (*Renderer, bool) {
 	if !tty || os.Getenv("TERM") == "dumb" {
 		return nil, false
 	}
-	if !enableVT(out) {
+	restore, ok := enableVT(out)
+	if !ok {
 		return nil, false
 	}
 	if _, ok := termWidth(out); !ok {
+		restore() // don't leave the console mode changed on the plain path
 		return nil, false
 	}
-	return newRenderer(out, func() (int, bool) { return termWidth(out) }), true
+	r := newRenderer(out, func() (int, bool) { return termWidth(out) })
+	r.restoreVT = restore
+	return r, true
 }
 
 // Start begins polling snap and painting the pinned block.
@@ -296,6 +301,9 @@ func (r *Renderer) Close() {
 		r.eraseBlockLocked(&b)
 		b.WriteString(showCursor + wrapOn)
 		r.out.Write(b.Bytes())
+		if r.restoreVT != nil {
+			r.restoreVT()
+		}
 		r.mu.Unlock()
 	})
 }

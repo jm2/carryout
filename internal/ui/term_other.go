@@ -6,5 +6,5 @@ package ui
 
 import "os"
 
-func termWidth(f *os.File) (int, bool) { return 0, false }
-func enableVT(f *os.File) bool         { return false }
+func termWidth(f *os.File) (int, bool)   { return 0, false }
+func enableVT(f *os.File) (func(), bool) { return nil, false }

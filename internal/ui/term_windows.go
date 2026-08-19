@@ -38,17 +38,23 @@ func termWidth(f *os.File) (int, bool) {
 	return w, w > 0
 }
 
-// enableVT turns on ANSI escape processing. Fails on pre-Win10 conhost, in
-// which case the caller falls back to plain output.
-func enableVT(f *os.File) bool {
+// enableVT turns on ANSI escape processing and returns a func that restores
+// the console's original mode — SetConsoleMode changes state that outlives
+// the process in that console, so a well-behaved app puts it back on exit.
+// Fails on pre-Win10 conhost, in which case the caller falls back to plain
+// output.
+func enableVT(f *os.File) (func(), bool) {
 	const enableVirtualTerminalProcessing = 0x0004
 	var mode uint32
 	if err := syscall.GetConsoleMode(syscall.Handle(f.Fd()), &mode); err != nil {
-		return false
+		return nil, false
 	}
 	if mode&enableVirtualTerminalProcessing != 0 {
-		return true
+		return func() {}, true // already on; nothing to restore
 	}
 	r, _, _ := procSetConsoleMode.Call(f.Fd(), uintptr(mode|enableVirtualTerminalProcessing))
-	return r != 0
+	if r == 0 {
+		return nil, false
+	}
+	return func() { procSetConsoleMode.Call(f.Fd(), uintptr(mode)) }, true
 }
