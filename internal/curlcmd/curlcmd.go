@@ -199,8 +199,11 @@ func CookieFromPaste(s string) (string, error) {
 	}
 
 	// A header line anywhere in the paste: "Cookie: …" or "-H 'cookie: …' \".
-	if low := strings.ToLower(s); strings.Contains(low, "cookie:") {
-		rest := s[strings.Index(low, "cookie:")+len("cookie:"):]
+	// Search case-insensitively on the original bytes: indexing into a
+	// ToLower'd copy is unsafe, because lowering invalid UTF-8 changes byte
+	// offsets (fuzz-found panic).
+	if idx := indexFold(s, "cookie:"); idx >= 0 {
+		rest := s[idx+len("cookie:"):]
 		line, remainder, _ := strings.Cut(rest, "\n")
 		value := line
 		// A hard-wrapped plain header paste continues onto later lines; a
@@ -216,6 +219,18 @@ func CookieFromPaste(s string) (string, error) {
 	}
 
 	return SanitizeCookie(s)
+}
+
+// indexFold returns the byte offset of the first ASCII-case-insensitive
+// occurrence of sub in s, or -1. Offsets are into s itself, which matters for
+// inputs containing invalid UTF-8.
+func indexFold(s, sub string) int {
+	for i := 0; i+len(sub) <= len(s); i++ {
+		if strings.EqualFold(s[i:i+len(sub)], sub) {
+			return i
+		}
+	}
+	return -1
 }
 
 // curlStart returns the byte offset of the first line whose first word is a
