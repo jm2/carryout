@@ -85,6 +85,20 @@ wl-paste > manifest.txt        # Wayland   (xclip -o > manifest.txt on X11,
 carryout init -manifest-file manifest.txt   # pbpaste on macOS, Get-Clipboard on Windows)
 ```
 
+**Working over SSH?** The clipboard lives on the machine you're sitting at,
+and an interactive paste into `cat` or carryout still goes through the remote
+pty's 4 KiB line limit. Read the clipboard locally and pipe it across (ssh
+with a command allocates no pty, so nothing truncates):
+
+```sh
+Get-Clipboard | ssh you@host "cat > /path/to/export/manifest.txt"  # Windows PowerShell
+pbpaste | ssh you@host "cat > /path/to/export/manifest.txt"        # macOS
+```
+
+(Pasting inside `nano`/`vim` over SSH also works — editors run the terminal
+in raw mode. The same applies to cURL captures: cookie headers can exceed
+4 KiB on one line, so move capture files the same way.)
+
 carryout defends in depth here: a paste that ends mid-entry is rejected, a
 4 KiB line arriving through a terminal is rejected, and interactive init asks
 you to confirm the parsed file count against the page before registering
