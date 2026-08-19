@@ -154,6 +154,34 @@ func TestParseInventoryRealSummary(t *testing.T) {
 	}
 }
 
+func TestParseInventoryDetectsTTYTruncation(t *testing.T) {
+	// A Linux TTY silently cuts a pasted line at 4096 bytes, which lands
+	// mid-entry in a long export summary. That must be an error, never a
+	// silently registered subset (a real user hit this: 142 files → 54).
+	full := realExportSummary()
+
+	// the exact real-world case: the kernel delivers the first 4095 bytes
+	if _, err := ParseInventory(full[:4095]); err == nil || !strings.Contains(err.Error(), "cut off") {
+		t.Errorf("4095-byte kernel truncation accepted: err = %v", err)
+	}
+	// cut inside the counter annotation
+	cut := strings.LastIndex(full[:4095], "(Number") + len("(Numb")
+	if _, err := ParseInventory(full[:cut]); err == nil || !strings.Contains(err.Error(), "cut off") {
+		t.Errorf("mid-counter truncation accepted: err = %v", err)
+	}
+	// cut inside a filename (dangling fragment)
+	frag := full[:strings.LastIndex(full[:4095], "takeout-")+12]
+	if _, err := ParseInventory(frag); err == nil || !strings.Contains(err.Error(), "cut off") {
+		t.Errorf("mid-filename truncation accepted: err = %v", err)
+	}
+	// the same text cut cleanly between entries still parses (count check is
+	// the human's job at init)
+	clean := full[:strings.LastIndex(full[:4095], "takeout-")]
+	if _, err := ParseInventory(clean); err != nil {
+		t.Errorf("cleanly-cut text rejected: %v", err)
+	}
+}
+
 func TestParseInventoryDedupsAndPlainLists(t *testing.T) {
 	entries, err := ParseInventory("takeout-20260818T182058Z-1-001.tgz\ntakeout-20260818T182058Z-1-002.tgz\ntakeout-20260818T182058Z-1-001.tgz\n")
 	if err != nil {

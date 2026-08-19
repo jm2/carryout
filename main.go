@@ -137,6 +137,7 @@ func cmdInit(args []string) error {
 	parts := fs.Int("parts", 0, "total part count — ONLY for simple single-sequence exports; grouped exports need the file list")
 	verifyMode := fs.String("verify", "full", "verification mode: full (decompress and check every byte) or quick (magic bytes + size)")
 	force := fs.Bool("force", false, "overwrite an existing carryout.json")
+	reuse := fs.Bool("reuse-capture", false, "with -force: reuse the captured URL, headers, and cookies already in this directory instead of pasting a new capture")
 	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
@@ -154,43 +155,73 @@ func cmdInit(args []string) error {
 	defer release()
 
 	in := bufio.NewReader(os.Stdin)
-	text, err := readCapture(in, *curlFile,
-		`Paste the "Copy as cURL" capture of one part download (the request to
+
+	var capturedURL, cookie string
+	var headers map[string]string
+	if *reuse {
+		if *curlFile != "" {
+			return errors.New("-reuse-capture and -curl-file are mutually exclusive")
+		}
+		old, err := state.Load(*dir)
+		if err != nil {
+			return fmt.Errorf("-reuse-capture needs the previous state: %w", err)
+		}
+		c, err := state.LoadCookie(*dir)
+		if err != nil {
+			return fmt.Errorf("-reuse-capture needs the existing cookies: %w", err)
+		}
+		capturedURL, cookie, headers = old.CapturedURL, c, old.Headers
+	} else {
+		text, err := readCapture(in, *curlFile,
+			`Paste the "Copy as cURL" capture of one part download (the request to
 takeout-download…usercontent.google.com), then press Enter on a blank line:`)
-	if err != nil {
-		return err
+		if err != nil {
+			return err
+		}
+		capture, err := curlcmd.Parse(text)
+		if err != nil {
+			return err
+		}
+		capturedURL = capture.URL
+		cookie = capture.Headers.Get("Cookie")
+		headers = replayHeaders(capture.Headers)
+		if cookie == "" {
+			return errors.New("the capture has no Cookie header — copy the cURL for the request your logged-in browser made")
+		}
 	}
 
-	capture, err := curlcmd.Parse(text)
-	if err != nil {
-		return err
-	}
-	tmpl, err := takeout.Derive(capture.URL)
+	tmpl, err := takeout.Derive(capturedURL)
 	if err != nil {
 		return err
 	}
 	if err := tmpl.SelfCheck(); err != nil {
 		return err
 	}
-	cookie := capture.Headers.Get("Cookie")
-	if cookie == "" {
-		return errors.New("the capture has no Cookie header — copy the cURL for the request your logged-in browser made")
-	}
 
-	entries, err := readInventory(in, tmpl, *manifestFile, *parts)
+	entries, fromPaste, err := readInventory(in, tmpl, *manifestFile, *parts)
 	if err != nil {
 		return err
 	}
 	if err := takeout.Calibrate(entries, tmpl); err != nil {
 		return err
 	}
+	if fromPaste && isTTY(os.Stdin) {
+		// The one check that catches every inventory mishap: a human compares
+		// the parsed count against the page.
+		fmt.Printf("\nParsed: %s\n", takeout.GroupSummary(entries))
+		fmt.Print("Does that match the file count shown on the Takeout page? [y/N]: ")
+		line, _ := in.ReadString('\n')
+		if ans := strings.ToLower(strings.TrimSpace(line)); ans != "y" && ans != "yes" {
+			return errors.New("aborted — if the count is short, the paste was cut off (terminals cap pasted lines at 4 KiB); save the summary to a file and re-run with -manifest-file")
+		}
+	}
 
 	st := state.New(*dir)
-	st.CapturedURL = capture.URL
+	st.CapturedURL = capturedURL
 	st.JobID = tmpl.JobID
 	st.TotalParts = len(entries)
 	st.VerifyMode = *verifyMode
-	st.Headers = replayHeaders(capture.Headers)
+	st.Headers = headers
 	seeded := 0
 	for i, e := range entries {
 		if !takeout.ValidFilename(e.Filename) {
@@ -250,32 +281,39 @@ takeout-download…usercontent.google.com), then press Enter on a blank line:`)
 }
 
 // readInventory obtains the export's file list: from -manifest-file, from
-// -parts synthesis (simple exports only), or interactively.
-func readInventory(in *bufio.Reader, tmpl *takeout.Template, manifestFile string, parts int) ([]takeout.Entry, error) {
+// -parts synthesis (simple exports only), or interactively. fromPaste reports
+// that the list came from an interactive paste (which deserves confirmation —
+// terminals can silently truncate long pastes).
+func readInventory(in *bufio.Reader, tmpl *takeout.Template, manifestFile string, parts int) (entries []takeout.Entry, fromPaste bool, err error) {
 	if manifestFile != "" {
 		b, err := os.ReadFile(manifestFile)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
-		return takeout.ParseInventory(string(b))
+		entries, err = takeout.ParseInventory(string(b))
+		return entries, false, err
 	}
 	if parts > 0 {
-		return takeout.Synthesize(tmpl, parts)
+		entries, err = takeout.Synthesize(tmpl, parts)
+		return entries, false, err
 	}
 	fmt.Println()
 	fmt.Println(`Now the file list. On the Takeout page, select and copy the export summary
 (the block listing every takeout-…tgz file), paste it here, and press Enter on
-a blank line. For a simple single-sequence export you can instead type just
-the part count:`)
+a blank line. If your terminal cuts long pastes, save the summary to a file
+and re-run with -manifest-file instead. For a simple single-sequence export
+you can type just the part count:`)
 	fmt.Println()
 	paste, err := readPaste(in)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if n, aerr := strconv.Atoi(strings.TrimSpace(paste)); aerr == nil && n > 0 {
-		return takeout.Synthesize(tmpl, n)
+		entries, err = takeout.Synthesize(tmpl, n)
+		return entries, false, err
 	}
-	return takeout.ParseInventory(paste)
+	entries, err = takeout.ParseInventory(paste)
+	return entries, true, err
 }
 
 // replayHeaders keeps the browser's headers so replayed requests look exactly
@@ -688,10 +726,17 @@ func readCapture(in *bufio.Reader, file, prompt string) (string, error) {
 }
 
 func readPaste(r *bufio.Reader) (string, error) {
+	tty := isTTY(os.Stdin)
 	var lines []string
 	for {
 		line, err := r.ReadString('\n')
 		trimmed := strings.TrimRight(line, "\r\n")
+		// Linux TTYs in canonical mode silently cut a pasted line at 4096
+		// bytes; a line this long arriving through a terminal has almost
+		// certainly lost its tail. Fail closed rather than act on a subset.
+		if tty && len(trimmed) >= 4080 {
+			return "", fmt.Errorf("a pasted line hit your terminal's 4 KiB line limit and was truncated by the kernel — save the paste to a file and use the -curl-file/-manifest-file flag instead (e.g. `wl-paste > file` on Wayland, `xclip -o > file` on X11)")
+		}
 		if strings.TrimSpace(trimmed) == "" {
 			if len(lines) > 0 {
 				break

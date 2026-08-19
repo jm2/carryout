@@ -76,6 +76,20 @@ summary — the block listing every `takeout-…tgz` with its "Number of times
 already downloaded" counter. carryout parses filenames, order, and counters
 out of that text; formatting doesn't matter.
 
+⚠️ **Big exports: use a file, not a terminal paste.** Terminals silently cut
+a pasted line at 4 KiB — enough for only ~50 entries of that one-line summary.
+Save the clipboard to a file and pass it instead:
+
+```sh
+wl-paste > manifest.txt        # Wayland   (xclip -o > manifest.txt on X11,
+carryout init -manifest-file manifest.txt   # pbpaste on macOS, Get-Clipboard on Windows)
+```
+
+carryout defends in depth here: a paste that ends mid-entry is rejected, a
+4 KiB line arriving through a terminal is rejected, and interactive init asks
+you to confirm the parsed file count against the page before registering
+anything.
+
 **4. Register and test** (run in the directory the archives should land in):
 
 ```sh
@@ -119,6 +133,7 @@ list. The non-obvious ones:
 |---|---|
 | `init -curl-file F` / `init -manifest-file F` | Read the capture / file list from files instead of prompting (scripted setup). |
 | `init -parts N` | Skip the file list for simple single-sequence exports only; grouped exports are refused. |
+| `init -force -reuse-capture` | Re-register (e.g. with a corrected file list) reusing the captured URL, headers, and cookies already in the directory — no new browser capture needed. Files already on disk are adopted and re-verified, not re-downloaded. |
 | `get -verify quick` | Skip full decompression checks on clean known-length downloads (magic bytes + size only). Resumed, adopted, and unknown-length parts are always fully verified regardless. |
 | `get -workers / -max-tries / -stall-timeout / -retry-delay` | Tuning; the defaults (3 / 2 / 2m / 30s) are deliberately conservative. |
 | `get -redo N` | Reset a corrupt/failed part and re-download it (deletes its file; spends a download attempt). |

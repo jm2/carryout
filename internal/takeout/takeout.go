@@ -140,8 +140,31 @@ type Entry struct {
 // Takeout page (the export summary, a saved page, or a plain list of names).
 // Duplicate mentions keep the first occurrence's position; a per-file
 // download counter following the name is captured when present.
+// truncFragRe matches text that ends in an unfinished filename stem — the
+// signature of a cut mid-name. A completed filename would contain a dot and
+// have been consumed by inventoryNameRe already, so a dotless takeout… tail
+// can only be a fragment.
+var truncFragRe = regexp.MustCompile(`(^|[^A-Za-z0-9])takeout[A-Za-z0-9_-]*$`)
+
+var errTruncatedPaste = errors.New("the paste ends mid-entry — it was almost certainly cut off by your terminal's 4 KiB line limit. Save the summary to a file instead and use -manifest-file (e.g. `wl-paste > manifest.txt` on Wayland, `xclip -o > manifest.txt` on X11, `pbpaste > manifest.txt` on macOS)")
+
 func ParseInventory(text string) ([]Entry, error) {
 	locs := inventoryNameRe.FindAllStringIndex(text, -1)
+	// A paste cut off by a terminal's line-length limit (Linux TTYs cap a
+	// pasted line at 4 KiB) ends mid-entry: either inside the counter
+	// annotation (an unclosed paren after the last filename) or inside a
+	// filename (a dangling "takeout-" fragment the regex couldn't match).
+	// Registering a silent subset of the export is the worst possible
+	// outcome, so refuse loudly.
+	if len(locs) > 0 {
+		tail := text[locs[len(locs)-1][1]:]
+		if open := strings.LastIndex(tail, "("); open >= 0 && !strings.Contains(tail[open:], ")") {
+			return nil, errTruncatedPaste
+		}
+		if truncFragRe.MatchString(strings.TrimRight(tail, " \t\r\n,")) {
+			return nil, errTruncatedPaste
+		}
+	}
 	var entries []Entry
 	seen := make(map[string]int)
 	for _, loc := range locs {
