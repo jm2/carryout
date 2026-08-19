@@ -12,6 +12,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -19,6 +20,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"text/tabwriter"
 	"time"
@@ -127,9 +129,67 @@ func parseFlags(fs *flag.FlagSet, args []string) error {
 	return nil
 }
 
-func logf(format string, args ...any) {
-	fmt.Printf(time.Now().Format("15:04:05")+"  "+format+"\n", args...)
+// logGate serializes log output with the interactive cookie prompt. Fatal
+// and auth events deliberately let in-flight transfers finish in the
+// background, so with several workers their completion lines (and the
+// periodic progress ticks) would otherwise land in the middle of the paste
+// screen. While held, event lines are buffered and replayed after the
+// prompt; progress ticks are dropped — they're stale within seconds.
+type logGate struct {
+	mu   sync.Mutex
+	out  io.Writer
+	held bool
+	buf  []string
 }
+
+func stampLine(format string, args ...any) string {
+	return time.Now().Format("15:04:05") + "  " + fmt.Sprintf(format, args...)
+}
+
+func (g *logGate) Logf(format string, args ...any) {
+	line := stampLine(format, args...)
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.held {
+		g.buf = append(g.buf, line)
+		return
+	}
+	fmt.Fprintln(g.out, line)
+}
+
+func (g *logGate) Progressf(format string, args ...any) {
+	line := stampLine(format, args...)
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.held {
+		return
+	}
+	fmt.Fprintln(g.out, line)
+}
+
+func (g *logGate) Hold() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.held = true
+}
+
+func (g *logGate) Release() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.held = false
+	if len(g.buf) == 0 {
+		return
+	}
+	fmt.Fprintf(g.out, "\n(%d log line(s) arrived while the prompt was up)\n", len(g.buf))
+	for _, l := range g.buf {
+		fmt.Fprintln(g.out, l)
+	}
+	g.buf = nil
+}
+
+var gate = &logGate{out: os.Stdout}
+
+func logf(format string, args ...any) { gate.Logf(format, args...) }
 
 // ---- init ----
 
@@ -416,6 +476,7 @@ func cmdGet(args []string) error {
 		RetryDelay:   *retryDelay,
 		DryRun:       *dryRun,
 		Logf:         logf,
+		ProgressLogf: gate.Progressf,
 	}
 	if !*noPrompt && isTTY(os.Stdin) {
 		opts.RefreshAuth = promptRefreshAuth
@@ -508,10 +569,17 @@ func applyRedo(st *state.State, dir string, redoSet map[int]bool, dryRun bool) e
 }
 
 func promptRefreshAuth(ctx context.Context, reason string) (string, error) {
+	// Silence background log output for the duration of the prompt so
+	// in-flight transfers finishing behind the scenes can't garble the paste.
+	gate.Hold()
+	defer gate.Release()
+
 	fmt.Println()
 	fmt.Println("================================================================")
 	fmt.Println("  Google session expired: " + reason)
-	fmt.Println("  All workers are paused; no attempts are being burned.")
+	fmt.Println("  No NEW downloads will start; transfers already in flight are")
+	fmt.Println("  finishing in the background (their log lines will appear")
+	fmt.Println("  after you paste). No attempts are being burned.")
 	fmt.Println()
 	fmt.Println("  In your (still logged-in) browser: open the Takeout page,")
 	fmt.Println("  start any part download, cancel it, and Copy as cURL the")

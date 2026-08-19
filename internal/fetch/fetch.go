@@ -82,6 +82,10 @@ type Options struct {
 	// honor ctx so Ctrl-C can abort a pending prompt.
 	RefreshAuth func(ctx context.Context, reason string) (string, error)
 	Logf        func(format string, args ...any)
+	// ProgressLogf receives the periodic (ephemeral) progress ticks, so the
+	// CLI can drop them while an interactive prompt owns the screen. Defaults
+	// to Logf.
+	ProgressLogf func(format string, args ...any)
 	// AttemptWarnAt logs a warning when a part's served-download count
 	// reaches this value (Takeout is believed to cap downloads per part).
 	AttemptWarnAt int
@@ -144,6 +148,9 @@ func New(tmpl *takeout.Template, st *state.State, cookie string, opt Options) *F
 	}
 	if opt.Logf == nil {
 		opt.Logf = func(string, ...any) {}
+	}
+	if opt.ProgressLogf == nil {
+		opt.ProgressLogf = opt.Logf
 	}
 	f := &Fetcher{
 		opt:      opt,
@@ -1080,7 +1087,7 @@ func (f *Fetcher) report(ctx context.Context, done chan<- struct{}) {
 		if eta, ok := f.eta(speed); ok {
 			line += " · ETA " + eta
 		}
-		f.logf("%s", line)
+		f.opt.ProgressLogf("%s", line)
 	}
 }
 
