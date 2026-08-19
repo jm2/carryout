@@ -763,6 +763,14 @@ func TestETAString(t *testing.T) {
 	if got, ok := ETAString(55*86400, 10); !ok || got != "5.5 days" {
 		t.Errorf("multi-day ETA = %q, %v", got, ok)
 	}
+	// rounding boundary (CodeRabbit on #4): 99.97 days is < 100 but %.1f
+	// renders "100.0 days" (10 cells); the formatted width must decide
+	if got, ok := ETAString(8637408, 1); !ok || got != "100 days" {
+		t.Errorf("99.97-day ETA = %q, %v (want whole-day fallback)", got, ok)
+	}
+	if got, ok := ETAString(8634816, 1); !ok || got != "99.9 days" {
+		t.Errorf("99.94-day ETA = %q, %v", got, ok)
+	}
 	// The live footer reserves exactly 9 cells; ETAString must never exceed
 	// it for any input (CodeRabbit finding on the stable-bar-width PR).
 	for _, c := range []struct {

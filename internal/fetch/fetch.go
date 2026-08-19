@@ -1182,13 +1182,16 @@ func ETAString(remaining int64, speed float64) (string, bool) {
 	secs := float64(remaining) / speed
 	if secs > 48*3600 {
 		days := secs / 86400
-		switch {
-		case days > 999:
+		if days > 999 {
 			return ">999 days", true // 9 cells; anything longer is noise anyway
-		case days >= 100:
-			return fmt.Sprintf("%.0f days", days), true
 		}
-		return fmt.Sprintf("%.1f days", days), true
+		// Decide on the FORMATTED width, not the raw value: 99.97 days is
+		// below 100 but %.1f rounds it to "100.0 days" (10 cells).
+		s := fmt.Sprintf("%.1f days", days)
+		if len(s) > 9 {
+			s = fmt.Sprintf("%.0f days", days)
+		}
+		return s, true
 	}
 	d := time.Duration(secs * float64(time.Second))
 	if d < 2*time.Minute {
