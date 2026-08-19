@@ -1169,7 +1169,10 @@ func (f *Fetcher) eta(speed float64) (string, bool) {
 
 // ETAString formats an estimated time remaining for `remaining` bytes at
 // `speed` bytes/second. Shared by the plain progress line and the live
-// display so the two can't drift.
+// display so the two can't drift. The result is guaranteed to be at most
+// 9 cells wide — the live footer reserves a fixed column for it, and a
+// wider string would re-flex the progress bar (the jitter class fixed in
+// the stable-bar-width change).
 func ETAString(remaining int64, speed float64) (string, bool) {
 	if remaining <= 0 || speed <= 0 {
 		return "", false
@@ -1178,7 +1181,14 @@ func ETAString(remaining int64, speed float64) (string, bool) {
 	// time.Duration overflows int64 nanoseconds and goes negative.
 	secs := float64(remaining) / speed
 	if secs > 48*3600 {
-		return fmt.Sprintf("%.1f days", secs/86400), true
+		days := secs / 86400
+		switch {
+		case days > 999:
+			return ">999 days", true // 9 cells; anything longer is noise anyway
+		case days >= 100:
+			return fmt.Sprintf("%.0f days", days), true
+		}
+		return fmt.Sprintf("%.1f days", days), true
 	}
 	d := time.Duration(secs * float64(time.Second))
 	if d < 2*time.Minute {

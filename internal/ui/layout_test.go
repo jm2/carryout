@@ -44,6 +44,11 @@ func TestRowsNeverExceedWidth(t *testing.T) {
 		if cells(agg) > usable {
 			t.Errorf("w=%d agg: %d cells (> %d): %q", w, cells(agg), usable, agg)
 		}
+		// a crawl produces a 100+ day ETA; the footer must still fit
+		crawl := aggRow(layoutSnap, 100, true, usable)
+		if cells(crawl) > usable {
+			t.Errorf("w=%d agg@crawl: %d cells (> %d): %q", w, cells(crawl), usable, crawl)
+		}
 		if cells(separator(usable)) > usable {
 			t.Errorf("w=%d separator too wide", w)
 		}

@@ -215,7 +215,9 @@ func aggRow(s fetch.Snapshot, speed float64, haveSpeed bool, usable int) string 
 		sizes = fmt.Sprintf("%10s/%s", fetch.HumanBytes(cum), fetch.HumanBytes(total))
 		if haveSpeed {
 			if e, ok := fetch.ETAString(s.Remaining, speed); ok {
-				eta = fmt.Sprintf("ETA %9s", e) // padded: width changes would re-flex the bar
+				// Fixed 9-cell column: padded when short, clamped when a
+				// future ETAString change ever overruns its width contract.
+				eta = fmt.Sprintf("ETA %9s", fit(e, 9))
 			}
 		}
 	}
