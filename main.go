@@ -29,7 +29,9 @@ import (
 	"github.com/jm2/carryout/internal/takeout"
 )
 
-const version = "0.2.0"
+// version is the release version, overridden at build time via
+// -ldflags "-X main.version=…" by the release workflow.
+var version = "0.2.0-dev"
 
 const usageText = `carryout — picks up your Google Takeout order
 

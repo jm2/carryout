@@ -1,0 +1,56 @@
+name: Fuzz
+
+# Go-native fuzzing of the two parsers that consume untrusted pasted input:
+# the cURL capture parser and the export-summary inventory parser. Weekly plus
+# on any PR that touches them; the unit-test suite already runs each target's
+# seed corpus on every CI run.
+on:
+  schedule:
+    - cron: "17 6 * * 1" # weekly, Monday 06:17 UTC
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "internal/curlcmd/**"
+      - "internal/takeout/**"
+      - ".github/workflows/fuzz.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    name: Fuzz parsers
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          check-latest: true
+          cache: false
+
+      - name: Fuzz curlcmd.Parse
+        run: go test ./internal/curlcmd -run '^$' -fuzz '^FuzzParse$' -fuzztime 90s
+
+      - name: Fuzz curlcmd.CookieFromPaste
+        run: go test ./internal/curlcmd -run '^$' -fuzz '^FuzzCookieFromPaste$' -fuzztime 90s
+
+      - name: Fuzz takeout.ParseInventory
+        run: go test ./internal/takeout -run '^$' -fuzz '^FuzzParseInventory$' -fuzztime 90s
+
+      - name: Fuzz takeout.Derive
+        run: go test ./internal/takeout -run '^$' -fuzz '^FuzzDerive$' -fuzztime 90s
+
+      - name: Upload any new crashers
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-crashers
+          path: |
+            internal/curlcmd/testdata/fuzz/
+            internal/takeout/testdata/fuzz/
+          if-no-files-found: ignore

@@ -1,0 +1,54 @@
+# Dependabot configuration
+# https://docs.github.com/code-security/dependabot/dependabot-version-updates/configuration-options-for-the-dependabot.yml-file
+#
+# NOTE: dependabot.yml itself CANNOT auto-merge anything. The `groups:` blocks
+# below only control how updates are BATCHED into pull requests. Auto-merge of
+# clean (patch/minor) bumps is handled separately by
+# .github/workflows/dependabot-automerge.yml together with a status-check
+# ruleset on `main` (see that workflow's header).
+#
+# `cooldown` delays opening update PRs until a few days after a release, giving
+# bad/yanked releases time to be pulled before they can be auto-merged.
+
+version: 2
+updates:
+  # ── Go modules (go.mod) ─────────────────────────────────────────────────────
+  # carryout is deliberately stdlib-only today; this entry exists so any future
+  # dependency is watched from the day it lands, and so Go toolchain directives
+  # get update PRs.
+  - package-ecosystem: "gomod"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+    cooldown:
+      default-days: 5
+    groups:
+      # One PR for ALL non-breaking bumps (patch + minor). Majors are
+      # deliberately EXCLUDED so each major arrives as its own PR for human
+      # review — and so the grouped PR's update-type stays within what the
+      # auto-merge workflow is allowed to merge.
+      gomod-minor-and-patch:
+        applies-to: version-updates
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+
+  # ── GitHub Actions (.github/workflows) ─────────────────────────────────────
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+    cooldown:
+      default-days: 5
+    groups:
+      actions-minor-and-patch:
+        applies-to: version-updates
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"

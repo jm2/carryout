@@ -1,0 +1,225 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to build (for example, v0.2.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  # Resolve the event tag once, validate it, and expose an immutable commit
+  # SHA to every downstream job.
+  prepare:
+    name: Resolve release source
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      build_ref: ${{ steps.source.outputs.build_ref }}
+      tag: ${{ steps.release.outputs.tag }}
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - name: Validate requested tag
+        id: release
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          DISPATCH_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_EVENT_NAME}" == "release" ]]; then
+            TAG="${RELEASE_TAG}"
+          elif [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            TAG="${DISPATCH_TAG}"
+          else
+            echo "Unsupported release event: ${GITHUB_EVENT_NAME}" >&2
+            exit 1
+          fi
+
+          SEMVER_TAG='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?(\+[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$'
+          if [[ ! "${TAG}" =~ ${SEMVER_TAG} ]]; then
+            echo "Release tag must be a v-prefixed semantic version; got '${TAG}'" >&2
+            exit 1
+          fi
+          echo "tag=${TAG}" >> "${GITHUB_OUTPUT}"
+          echo "version=${TAG#v}" >> "${GITHUB_OUTPUT}"
+
+      - uses: actions/checkout@v7
+        with:
+          ref: refs/tags/${{ steps.release.outputs.tag }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Resolve immutable source
+        id: source
+        run: |
+          echo "build_ref=$(git rev-parse HEAD)" >> "${GITHUB_OUTPUT}"
+
+  # ── Build all six platform archives from the resolved SHA ─────────────────
+  build:
+    name: Build release archives
+    needs: prepare
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.prepare.outputs.build_ref }}
+          persist-credentials: false
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          check-latest: true
+          cache: false
+
+      # A dispatch build can target any historical tag, so gate the build on
+      # the tagged source actually passing its own checks.
+      - name: Verify tagged source (vet + tests)
+        run: |
+          go vet ./...
+          go test ./...
+
+      - name: Build and package all targets
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64; do
+            goos="${target%/*}"
+            goarch="${target#*/}"
+            bin="carryout"
+            [[ "${goos}" == "windows" ]] && bin="carryout.exe"
+
+            stage="$(mktemp -d)"
+            GOOS="${goos}" GOARCH="${goarch}" CGO_ENABLED=0 \
+              go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" \
+              -o "${stage}/${bin}" .
+            cp README.md LICENSE "${stage}/"
+
+            base="carryout_${VERSION}_${goos}_${goarch}"
+            if [[ "${goos}" == "windows" ]]; then
+              (cd "${stage}" && zip -q -X "${GITHUB_WORKSPACE}/dist/${base}.zip" "${bin}" README.md LICENSE)
+            else
+              tar --owner=0 --group=0 --numeric-owner \
+                -czf "dist/${base}.tar.gz" -C "${stage}" "${bin}" README.md LICENSE
+            fi
+            rm -rf "${stage}"
+            echo "packaged ${base}"
+          done
+
+      - name: Smoke-test the native binary reports the release version
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          tar -xzf "dist/carryout_${VERSION}_linux_amd64.tar.gz" -C "${RUNNER_TEMP}" carryout
+          got="$("${RUNNER_TEMP}/carryout" version)"
+          echo "${got}"
+          [[ "${got}" == "carryout ${VERSION}" ]]
+
+      - name: Upload release archives
+        uses: actions/upload-artifact@v7
+        with:
+          name: carryout-release-archives
+          path: dist/
+          if-no-files-found: error
+
+  # ── SHA256 checksums over the exact expected asset set ────────────────────
+  checksums:
+    name: SHA256 Checksums
+    needs: [prepare, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+
+      - name: Generate SHA256SUMS
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          cd artifacts
+          expected_assets=(
+            "carryout_${VERSION}_darwin_amd64.tar.gz"
+            "carryout_${VERSION}_darwin_arm64.tar.gz"
+            "carryout_${VERSION}_linux_amd64.tar.gz"
+            "carryout_${VERSION}_linux_arm64.tar.gz"
+            "carryout_${VERSION}_windows_amd64.zip"
+            "carryout_${VERSION}_windows_arm64.zip"
+          )
+          declare -A release_paths=()
+          while IFS= read -r -d '' path; do
+            name="${path##*/}"
+            if [[ -n "${release_paths[$name]+present}" ]]; then
+              echo "Duplicate release artifact filename: ${name}" >&2
+              exit 1
+            fi
+            release_paths["$name"]="$path"
+          done < <(find . -type f \( -name '*.tar.gz' -o -name '*.zip' \) -print0)
+
+          if (( ${#release_paths[@]} != ${#expected_assets[@]} )); then
+            echo "Expected ${#expected_assets[@]} unique release assets; found ${#release_paths[@]}" >&2
+            printf '  %s\n' "${!release_paths[@]}" | LC_ALL=C sort >&2
+            exit 1
+          fi
+          for name in "${expected_assets[@]}"; do
+            if [[ -z "${release_paths[$name]+present}" ]]; then
+              echo "Missing release artifact: ${name}" >&2
+              exit 1
+            fi
+          done
+
+          {
+            for name in "${expected_assets[@]}"; do
+              digest="$(sha256sum "${release_paths[$name]}")"
+              printf '%s  %s\n' "${digest%% *}" "$name"
+            done
+          } | LC_ALL=C sort -k2 > ../SHA256SUMS.txt
+          cat ../SHA256SUMS.txt
+
+      - name: Upload SHA256SUMS as artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: SHA256SUMS
+          path: SHA256SUMS.txt
+          if-no-files-found: error
+
+  # The only job with a repository write token. It checks out no project or
+  # build code and uses immutable action revisions only to transfer completed
+  # artifacts to the already-created GitHub release.
+  publish:
+    name: Publish release assets
+    if: github.event_name == 'release'
+    needs: [prepare, checksums]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download verified build artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Publish assets to the validated release tag
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
+        with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          fail_on_unmatched_files: true
+          files: |
+            release-assets/*.tar.gz
+            release-assets/*.zip
+            release-assets/SHA256SUMS.txt

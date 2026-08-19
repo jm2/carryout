@@ -1,5 +1,7 @@
 # carryout
 
+[![CI](https://github.com/jm2/carryout/actions/workflows/ci.yml/badge.svg)](https://github.com/jm2/carryout/actions/workflows/ci.yml)
+
 **Picks up your Google Takeout order.**
 
 Google Takeout will happily export 5+ TB of Google Photos — as a hundred-plus

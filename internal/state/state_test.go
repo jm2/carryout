@@ -4,6 +4,7 @@ package state
 
 import (
 	"os"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -155,7 +156,8 @@ func TestCookieFilePermissionsAndAtomicity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if fi.Mode().Perm() != 0600 {
+	// Windows has no POSIX mode bits; Go maps them to read-only-or-not.
+	if runtime.GOOS != "windows" && fi.Mode().Perm() != 0600 {
 		t.Errorf("cookie file mode = %o, want 0600", fi.Mode().Perm())
 	}
 	// overwrite must go through rename, leaving no window without a file

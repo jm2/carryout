@@ -1,0 +1,150 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  # ── Lint (gofmt, vet, tidy) ────────────────────────────────────────────────
+  lint:
+    name: Lint
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          check-latest: true
+          cache: false # zero-dependency module; nothing worth caching
+
+      - name: gofmt (no diffs)
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "${unformatted}" ]; then
+            echo 'gofmt required for:' >&2
+            printf '%s\n' "${unformatted}" >&2
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go mod tidy (no drift)
+        run: go mod tidy -diff
+
+      - name: go build
+        run: go build ./...
+
+  # ── Security audit ─────────────────────────────────────────────────────────
+  # The Go analog of tributary's cargo-audit job. With zero third-party
+  # dependencies this mostly checks the standard library against the running
+  # Go release — exactly the surface a stdlib-only downloader exposes.
+  audit:
+    name: Security Audit
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          check-latest: true
+          cache: false
+
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+
+  # ── Tests on every supported OS ────────────────────────────────────────────
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      # Preserve the independent result from each OS when a platform-specific
+      # failure hits one of the others.
+      fail-fast: false
+      matrix:
+        include:
+          - os: linux
+            runner: ubuntu-24.04
+            race: "-race"
+          - os: macos
+            runner: macos-15
+            race: "-race"
+          # -race needs a C toolchain; keep Windows on the pure-Go path so a
+          # runner-image mingw change can never break CI. Linux+macOS already
+          # race-check the (platform-neutral) concurrency.
+          - os: windows
+            runner: windows-2025
+            race: ""
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          check-latest: true
+          cache: false
+
+      - name: go test
+        run: go test ${{ matrix.race }} ./...
+
+  # ── MSRV (minimum supported Go version) ────────────────────────────────────
+  # Compile-and-test proof for the `go` directive declared in go.mod, so code
+  # written against the latest stable can't silently raise the real floor.
+  msrv:
+    name: MSRV (go.mod)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: go build + test at the declared minimum
+        env:
+          # go.mod's `go` directive is the authoritative floor; forbid the
+          # toolchain from transparently upgrading past it.
+          GOTOOLCHAIN: local
+        run: |
+          go version
+          go build ./...
+          go test ./...
+
+  # ── Cross-compile every release target ─────────────────────────────────────
+  cross-compile:
+    name: Cross-compile
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          check-latest: true
+          cache: false
+
+      - name: Build all release targets
+        run: |
+          set -euo pipefail
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64; do
+            GOOS="${target%/*}" GOARCH="${target#*/}" CGO_ENABLED=0 go build ./...
+            echo "ok ${target}"
+          done
