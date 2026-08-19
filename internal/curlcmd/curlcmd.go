@@ -51,7 +51,7 @@ func Parse(s string) (*Capture, error) {
 	var cookieParts []string
 
 	i := 0
-	if len(toks) > 0 && (toks[0] == "curl" || strings.HasSuffix(toks[0], "/curl") || toks[0] == "curl.exe") {
+	if len(toks) > 0 && isCurlWord(toks[0]) {
 		i = 1
 	}
 
@@ -130,12 +130,44 @@ func Parse(s string) (*Capture, error) {
 	}
 
 	if len(cookieParts) > 0 {
-		cap.Headers.Set("Cookie", strings.Join(cookieParts, "; "))
+		ck, err := SanitizeCookie(strings.Join(cookieParts, "; "))
+		if err != nil {
+			return nil, fmt.Errorf("cookie in capture: %w", err)
+		}
+		cap.Headers.Set("Cookie", ck)
 	}
-	if cap.URL == "" {
-		return nil, errors.New("no URL found in the pasted command")
+	if !strings.HasPrefix(cap.URL, "http://") && !strings.HasPrefix(cap.URL, "https://") {
+		return nil, errors.New(`no http(s) URL found — paste the bash "Copy as cURL" output (not the cmd or PowerShell variant)`)
 	}
 	return cap, nil
+}
+
+func isCurlWord(tok string) bool {
+	return tok == "curl" || tok == "curl.exe" || strings.HasSuffix(tok, "/curl")
+}
+
+// SanitizeCookie normalizes a Cookie header value from a paste: hard-wrap
+// newlines and stray control characters are collapsed (an embedded newline
+// would make every subsequent request fail with an invalid header), and the
+// shape is validated so garbage can't be silently saved as the session.
+func SanitizeCookie(s string) (string, error) {
+	s = strings.Join(strings.Fields(s), " ")
+	if s == "" || !strings.Contains(s, "=") {
+		return "", errors.New("that doesn't look like a cookie string")
+	}
+	for _, chunk := range strings.Split(s, ";") {
+		chunk = strings.TrimSpace(chunk)
+		if chunk == "" {
+			continue
+		}
+		if !strings.Contains(chunk, "=") {
+			if len(chunk) > 40 {
+				chunk = chunk[:40] + "…"
+			}
+			return "", fmt.Errorf("cookie fragment %q has no '=' — paste the full Cookie header value", chunk)
+		}
+	}
+	return s, nil
 }
 
 // CookieFromPaste extracts a Cookie header value from user input that may be
@@ -145,8 +177,10 @@ func CookieFromPaste(s string) (string, error) {
 	if s == "" {
 		return "", errors.New("empty paste")
 	}
-	first := strings.Fields(s)[0]
-	if first == "curl" || first == "curl.exe" || strings.HasSuffix(first, "/curl") {
+	if low := strings.ToLower(s); strings.Contains(low, "invoke-webrequest") || strings.Contains(low, "invoke-restmethod") || strings.Contains(s, "@{") {
+		return "", errors.New(`this looks like PowerShell output — use "Copy as cURL (bash)", or paste just the cookie string`)
+	}
+	if isCurlWord(strings.Fields(s)[0]) {
 		c, err := Parse(s)
 		if err != nil {
 			return "", err
@@ -155,15 +189,12 @@ func CookieFromPaste(s string) (string, error) {
 		if ck == "" {
 			return "", errors.New("that capture has no Cookie header — copy the request that actually carries your session cookies")
 		}
-		return ck, nil
+		return ck, nil // already sanitized by Parse
 	}
 	if len(s) >= 7 && strings.EqualFold(s[:7], "cookie:") {
 		s = strings.TrimSpace(s[7:])
 	}
-	if !strings.Contains(s, "=") {
-		return "", errors.New("that doesn't look like a cURL command or a cookie string")
-	}
-	return s, nil
+	return SanitizeCookie(s)
 }
 
 func looksLikeCmdFormat(s string) bool {

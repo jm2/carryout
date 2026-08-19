@@ -19,6 +19,10 @@ import (
 const (
 	FileName       = "carryout.json"
 	CookieFileName = "cookies.txt"
+
+	// Version is bumped whenever the schema changes incompatibly; Load
+	// refuses other versions rather than silently misreading them.
+	Version = 2
 )
 
 type PartStatus string
@@ -33,19 +37,31 @@ const (
 	// Corrupt: on disk but failed integrity verification. Re-downloading costs
 	// another attempt, so it takes an explicit -redo to requeue.
 	Corrupt PartStatus = "corrupt"
-	// Attention: gave up after the per-run retry cap; a fresh `carryout get`
-	// will requeue it.
+	// Attention: gave up after the per-run retry cap or a non-transient
+	// per-part error; a fresh `carryout get` will requeue it.
 	Attention PartStatus = "attention"
 )
 
+func validStatus(s PartStatus) bool {
+	switch s {
+	case Pending, Downloaded, Done, Corrupt, Attention:
+		return true
+	}
+	return false
+}
+
 type Part struct {
-	Num          int        `json:"num"`
-	Filename     string     `json:"filename"`
+	Num      int    `json:"num"`
+	Filename string `json:"filename"`
+	// Index is the part's i= query value from the export inventory; -1 when
+	// the captured URL had no index parameter.
+	Index        int        `json:"index"`
 	Status       PartStatus `json:"status"`
 	ExpectedSize int64      `json:"expected_size,omitempty"`
 	ActualSize   int64      `json:"actual_size,omitempty"`
 	// Attempts counts downloads Google actually started serving — the number
-	// that plausibly counts against Takeout's per-part download limit.
+	// that plausibly counts against Takeout's per-part download limit. It is
+	// seeded at init from the page's "Number of times already downloaded".
 	Attempts    int       `json:"attempts,omitempty"`
 	LastError   string    `json:"last_error,omitempty"`
 	CompletedAt time.Time `json:"completed_at,omitzero"`
@@ -66,13 +82,14 @@ type State struct {
 	dir string
 }
 
-// New creates a fresh state rooted at dir. Filenames must be filled in by the
+// New creates a fresh state rooted at dir. Parts must be filled in by the
 // caller.
 func New(dir string) *State {
-	return &State{Version: 1, CreatedAt: time.Now().UTC(), dir: dir}
+	return &State{Version: Version, CreatedAt: time.Now().UTC(), dir: dir}
 }
 
-func Path(dir string) string { return filepath.Join(dir, FileName) }
+func Path(dir string) string       { return filepath.Join(dir, FileName) }
+func backupPath(dir string) string { return Path(dir) + ".bak" }
 
 func Exists(dir string) bool {
 	_, err := os.Stat(Path(dir))
@@ -89,13 +106,30 @@ func Load(dir string) (*State, error) {
 	}
 	var s State
 	if err := json.Unmarshal(b, &s); err != nil {
-		return nil, fmt.Errorf("parsing %s: %w", Path(dir), err)
+		hint := ""
+		if _, berr := os.Stat(backupPath(dir)); berr == nil {
+			hint = fmt.Sprintf(" — a previous version exists at %s; inspect it and copy it over %s to recover", backupPath(dir), FileName)
+		}
+		return nil, fmt.Errorf("parsing %s: %w%s", Path(dir), err, hint)
+	}
+	if s.Version != Version {
+		return nil, fmt.Errorf("%s has state version %d but this carryout speaks version %d — use a matching carryout build, or re-run `carryout init -force`", Path(dir), s.Version, Version)
+	}
+	for _, p := range s.Parts {
+		if !validStatus(p.Status) {
+			return nil, fmt.Errorf("%s: part %d has unknown status %q — refusing to guess; fix the file or re-init", Path(dir), p.Num, p.Status)
+		}
+		if p.Filename != filepath.Base(p.Filename) || strings.ContainsAny(p.Filename, `/\:`) || strings.Contains(p.Filename, "..") {
+			return nil, fmt.Errorf("%s: part %d has unsafe filename %q", Path(dir), p.Num, p.Filename)
+		}
 	}
 	s.dir = dir
 	return &s, nil
 }
 
-// Save writes the state atomically (temp file + rename).
+// Save writes the state durably and atomically: temp file, fsync, keep the
+// previous version as .bak, rename into place. The audit trail is the one
+// file whose loss is unrecoverable, so it gets more care than the archives.
 func (s *State) Save() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -107,11 +141,28 @@ func (s *State) saveLocked() error {
 	if err != nil {
 		return err
 	}
-	tmp := Path(s.dir) + ".tmp"
-	if err := os.WriteFile(tmp, append(b, '\n'), 0644); err != nil {
+	final := Path(s.dir)
+	tmp := final + ".tmp"
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, Path(s.dir))
+	_, werr := f.Write(append(b, '\n'))
+	if serr := f.Sync(); werr == nil {
+		werr = serr
+	}
+	if cerr := f.Close(); werr == nil {
+		werr = cerr
+	}
+	if werr != nil {
+		os.Remove(tmp)
+		return werr
+	}
+	if _, err := os.Stat(final); err == nil {
+		_ = os.Remove(backupPath(s.dir)) // Windows: rename won't clobber reliably
+		_ = os.Rename(final, backupPath(s.dir))
+	}
+	return os.Rename(tmp, final)
 }
 
 // Update applies fn under the state lock and saves the result.
@@ -159,15 +210,52 @@ func (s *State) Counts() (pending, downloaded, done, attention, corrupt int, don
 	return
 }
 
+// RemainingEstimate estimates bytes still to download: known expected sizes
+// where recorded, the average completed-part size for the rest. Shared by the
+// disk-space warning and the ETA display so the two can't drift.
+func (s *State) RemainingEstimate() (remaining int64, ok bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var doneBytes, doneCount int64
+	unknown := 0
+	for _, p := range s.Parts {
+		switch p.Status {
+		case Done, Downloaded:
+			doneBytes += p.ActualSize
+			doneCount++
+		default:
+			if p.ExpectedSize > 0 {
+				remaining += p.ExpectedSize
+			} else {
+				unknown++
+			}
+		}
+	}
+	if unknown > 0 {
+		if doneCount == 0 {
+			return 0, false // nothing to extrapolate from
+		}
+		remaining += int64(unknown) * (doneBytes / doneCount)
+	}
+	return remaining, true
+}
+
 func CookiePath(dir string) string { return filepath.Join(dir, CookieFileName) }
 
-// SaveCookie stores the Cookie header value with owner-only permissions.
+// SaveCookie stores the Cookie header value with owner-only permissions,
+// atomically (temp + rename) so an interrupt can't leave it missing or
+// truncated.
 func SaveCookie(dir, cookie string) error {
-	p := CookiePath(dir)
-	// O_TRUNC via WriteFile keeps existing perms, so remove first to be sure
-	// a previously loose file doesn't survive.
-	_ = os.Remove(p)
-	return os.WriteFile(p, []byte(strings.TrimSpace(cookie)+"\n"), 0600)
+	final := CookiePath(dir)
+	tmp := final + ".tmp"
+	if err := os.WriteFile(tmp, []byte(strings.TrimSpace(cookie)+"\n"), 0600); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, final); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return nil
 }
 
 func LoadCookie(dir string) (string, error) {

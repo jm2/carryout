@@ -115,3 +115,41 @@ func TestCookieFromPaste(t *testing.T) {
 		t.Error("expected error for junk input")
 	}
 }
+
+func TestCookieFromPasteCollapsesHardWraps(t *testing.T) {
+	// a cookie hard-wrapped across lines by an editor must not keep the
+	// newline (it would make every request an invalid-header failure)
+	got, err := CookieFromPaste("SID=aaa;\nHSID=bbb;\n\tSSID=ccc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.ContainsAny(got, "\r\n\t") {
+		t.Errorf("control chars survived: %q", got)
+	}
+	if got != "SID=aaa; HSID=bbb; SSID=ccc" {
+		t.Errorf("got %q", got)
+	}
+}
+
+func TestCookieFromPasteRejectsPowerShell(t *testing.T) {
+	ps := `Invoke-WebRequest -Uri "https://example.com/x-001.tgz" -Headers @{"cookie"="SID=a"}`
+	if _, err := CookieFromPaste(ps); err == nil || !strings.Contains(err.Error(), "PowerShell") {
+		t.Errorf("err = %v, want PowerShell rejection", err)
+	}
+}
+
+func TestParseRejectsPowerShell(t *testing.T) {
+	_, err := Parse(`Invoke-WebRequest -Uri "https://example.com/x-001.tgz"`)
+	if err == nil || !strings.Contains(err.Error(), "http(s) URL") {
+		t.Errorf("err = %v, want no-URL rejection", err)
+	}
+}
+
+func TestSanitizeCookieValidatesShape(t *testing.T) {
+	if _, err := SanitizeCookie("SID=a; ; HSID=b"); err != nil {
+		t.Errorf("empty chunk should be tolerated: %v", err)
+	}
+	if _, err := SanitizeCookie("SID=a; brokenfragment"); err == nil {
+		t.Error("fragment without '=' accepted")
+	}
+}

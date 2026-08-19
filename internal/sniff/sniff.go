@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 // Package sniff classifies HTTP response bodies (archive vs. HTML error page)
-// and fully verifies downloaded archives — the equivalent of gzip -t.
+// and verifies archive integrity — both on disk (the equivalent of gzip -t)
+// and inline while a download streams.
 package sniff
 
 import (
@@ -9,17 +10,28 @@ import (
 	"bufio"
 	"bytes"
 	"compress/gzip"
+	"context"
 	"fmt"
 	"io"
+	"mime"
 	"os"
 	"strings"
 )
 
+// IsHTMLContentType reports whether an HTTP Content-Type header announces an
+// HTML page.
+func IsHTMLContentType(contentType string) bool {
+	mt, _, err := mime.ParseMediaType(contentType)
+	if err != nil {
+		mt = strings.ToLower(strings.TrimSpace(contentType))
+	}
+	return mt == "text/html" || mt == "application/xhtml+xml"
+}
+
 // IsHTML reports whether a response looks like an HTML page rather than an
 // archive, from its Content-Type and leading bytes.
 func IsHTML(contentType string, head []byte) bool {
-	ct := strings.ToLower(contentType)
-	if strings.Contains(ct, "text/html") || strings.Contains(ct, "application/xhtml") {
+	if IsHTMLContentType(contentType) {
 		return true
 	}
 	h := bytes.TrimLeft(head, " \t\r\n")
@@ -73,10 +85,24 @@ func FileKind(path string) (string, error) {
 	return Kind(head[:n]), nil
 }
 
+// ctxReader aborts a long read loop promptly when ctx is cancelled, so a
+// 50 GiB verification doesn't hold up Ctrl-C for minutes.
+type ctxReader struct {
+	ctx context.Context
+	r   io.Reader
+}
+
+func (c *ctxReader) Read(p []byte) (int, error) {
+	if err := c.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return c.r.Read(p)
+}
+
 // VerifyFile reads the whole archive to confirm its integrity: for gzip this
 // decompresses the full stream and checks the trailing CRC (what gzip -t
 // does); for zip it reads every entry so each CRC is checked.
-func VerifyFile(path string) error {
+func VerifyFile(ctx context.Context, path string) error {
 	f, err := os.Open(path)
 	if err != nil {
 		return err
@@ -94,7 +120,7 @@ func VerifyFile(path string) error {
 
 	switch Kind(head[:n]) {
 	case "gzip":
-		br := bufio.NewReaderSize(f, 1<<20)
+		br := bufio.NewReaderSize(&ctxReader{ctx, f}, 1<<20)
 		zr, err := gzip.NewReader(br)
 		if err != nil {
 			return fmt.Errorf("gzip header: %w", err)
@@ -113,11 +139,14 @@ func VerifyFile(path string) error {
 			return fmt.Errorf("zip directory: %w", err)
 		}
 		for _, zf := range zr.File {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			rc, err := zf.Open()
 			if err != nil {
 				return fmt.Errorf("zip entry %s: %w", zf.Name, err)
 			}
-			_, err = io.Copy(io.Discard, rc)
+			_, err = io.Copy(io.Discard, &ctxReader{ctx, rc})
 			cerr := rc.Close()
 			if err != nil {
 				return fmt.Errorf("zip entry %s: %w", zf.Name, err)
@@ -130,4 +159,51 @@ func VerifyFile(path string) error {
 	default:
 		return fmt.Errorf("unrecognized archive magic bytes % x", head[:n])
 	}
+}
+
+// StreamVerifier checks a gzip stream's integrity while it is being written,
+// so a clean download needs no second 50 GiB read from disk afterwards.
+// Write the downloaded bytes to it alongside the file, call Finish at clean
+// EOF for the verdict, or Abort if the transfer failed.
+type StreamVerifier struct {
+	pw   *io.PipeWriter
+	done chan error
+}
+
+// NewGzipStreamVerifier starts the decompressing consumer. The pipe applies
+// backpressure: the download can't outrun verification, which caps a worker
+// at gzip-inflate speed (well above any single Takeout connection).
+func NewGzipStreamVerifier() *StreamVerifier {
+	pr, pw := io.Pipe()
+	done := make(chan error, 1)
+	go func() {
+		br := bufio.NewReaderSize(pr, 1<<20)
+		zr, err := gzip.NewReader(br)
+		if err == nil {
+			_, err = io.Copy(io.Discard, zr)
+			if cerr := zr.Close(); err == nil {
+				err = cerr
+			}
+		}
+		// Keep draining after a verdict so the writer never blocks on a
+		// stalled pipe.
+		io.Copy(io.Discard, pr)
+		done <- err
+	}()
+	return &StreamVerifier{pw: pw, done: done}
+}
+
+func (v *StreamVerifier) Write(p []byte) (int, error) { return v.pw.Write(p) }
+
+// Finish signals clean end-of-stream and returns the integrity verdict.
+func (v *StreamVerifier) Finish() error {
+	v.pw.Close()
+	return <-v.done
+}
+
+// Abort tears the verifier down after a failed transfer; the verdict is
+// discarded.
+func (v *StreamVerifier) Abort() {
+	v.pw.CloseWithError(io.ErrClosedPipe)
+	<-v.done
 }

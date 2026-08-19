@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 // Package fetch downloads Takeout archive parts: a small pool of workers,
-// resume via Range requests, a stall watchdog, content sniffing on every
-// response, and a global halt the moment authentication looks dead — so a
-// dead session never burns download attempts across the whole queue.
+// resume via Range requests, a stall watchdog, content classification on
+// every response, and a global halt the moment authentication looks dead — so
+// a dead session never burns download attempts across the whole queue.
 package fetch
 
 import (
@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -31,12 +32,12 @@ import (
 var (
 	errAuthRedirect = errors.New("redirected to a Google sign-in page")
 	errAuthExpired  = errors.New("session expired")
-	errThrottled    = errors.New("throttled (HTTP 429)")
+	errNotFound     = errors.New("HTTP 404")
 	errStalled      = errors.New("transfer stalled")
 	errGaveUp       = errors.New("gave up on part") // non-fatal: part flagged, run continues
 )
 
-// fatalError stops the whole run.
+// fatalError stops the whole run (no new attempts; in-flight ones finish).
 type fatalError struct {
 	msg        string
 	authNeeded bool
@@ -56,6 +57,16 @@ type retryableError struct{ err error }
 func (e *retryableError) Error() string { return e.err.Error() }
 func (e *retryableError) Unwrap() error { return e.err }
 
+// partBrokenError flags one part for attention without stopping the run.
+type partBrokenError struct{ msg string }
+
+func (e *partBrokenError) Error() string { return e.msg }
+
+// throttledError carries the server's Retry-After hint, if any.
+type throttledError struct{ after time.Duration }
+
+func (e *throttledError) Error() string { return "throttled (HTTP 429)" }
+
 type Options struct {
 	Dir          string
 	Workers      int
@@ -64,11 +75,12 @@ type Options struct {
 	Only         map[int]bool // nil = all parts
 	StallTimeout time.Duration
 	RetryDelay   time.Duration
-	Cooldown     time.Duration // wait after HTTP 429
+	Cooldown     time.Duration // minimum wait after HTTP 429
 	DryRun       bool
 	// RefreshAuth is called (serialized; all new requests are held) when the
-	// session looks expired. It returns a fresh Cookie header value.
-	RefreshAuth func(reason string) (string, error)
+	// session looks expired. It returns a fresh Cookie header value. It must
+	// honor ctx so Ctrl-C can abort a pending prompt.
+	RefreshAuth func(ctx context.Context, reason string) (string, error)
 	Logf        func(format string, args ...any)
 	// AttemptWarnAt logs a warning when a part's served-download count
 	// reaches this value (Takeout is believed to cap downloads per part).
@@ -102,6 +114,9 @@ type Fetcher struct {
 
 	cdMu          sync.Mutex
 	cooldownUntil time.Time
+
+	notFoundStreak atomic.Int32
+	htmlPages      atomic.Int32
 
 	progMu   sync.Mutex
 	progress map[int]*partProgress
@@ -141,7 +156,24 @@ func New(tmpl *takeout.Template, st *state.State, cookie string, opt Options) *F
 	return f
 }
 
+// googleOwned reports whether a redirect target is a Google-operated host
+// that should keep receiving our session cookies.
+func googleOwned(host string) bool {
+	for _, d := range []string{"google.com", "googleusercontent.com", "googleapis.com", "gstatic.com"} {
+		if host == d || strings.HasSuffix(host, "."+d) {
+			return true
+		}
+	}
+	return false
+}
+
 func (f *Fetcher) newClient() *http.Client {
+	// HTTP/1.1 only: with HTTP/2 Go multiplexes every worker onto one TCP
+	// connection, coupling all transfers to a single congestion window and
+	// per-stream flow-control caps. Bulk parallel downloads want independent
+	// connections.
+	protos := new(http.Protocols)
+	protos.SetHTTP1(true)
 	tr := &http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
 		DisableCompression:    true, // archives are already compressed; keep Content-Length honest
@@ -149,7 +181,7 @@ func (f *Fetcher) newClient() *http.Client {
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   30 * time.Second,
 		ResponseHeaderTimeout: 60 * time.Second,
-		ForceAttemptHTTP2:     true,
+		Protocols:             protos,
 	}
 	return &http.Client{
 		Transport: tr,
@@ -158,11 +190,12 @@ func (f *Fetcher) newClient() *http.Client {
 				return errors.New("too many redirects")
 			}
 			host := strings.ToLower(req.URL.Hostname())
-			if strings.Contains(host, "accounts.google") || strings.Contains(strings.ToLower(req.URL.Path), "servicelogin") {
+			if host == "accounts.google.com" || strings.HasSuffix(host, ".accounts.google.com") ||
+				strings.Contains(strings.ToLower(req.URL.Path), "servicelogin") {
 				return errAuthRedirect
 			}
-			// Go drops Cookie on cross-host redirects; keep it for Google-owned hosts.
-			if host == "google.com" || strings.HasSuffix(host, ".google.com") || strings.HasSuffix(host, ".googleusercontent.com") {
+			// Go drops Cookie on cross-host redirects; keep it for Google hosts.
+			if googleOwned(host) {
 				_, cookie := f.snapshotAuth()
 				req.Header.Set("Cookie", cookie)
 			}
@@ -188,7 +221,7 @@ func (f *Fetcher) authChanged(gen int) bool {
 // refreshAuth swaps in fresh cookies. Serialized on authMu: while one worker
 // prompts, every other worker's next attempt blocks in snapshotAuth, so no
 // request is sent with cookies already known to be dead.
-func (f *Fetcher) refreshAuth(seenGen int, reason string) error {
+func (f *Fetcher) refreshAuth(ctx context.Context, seenGen int, reason string) error {
 	f.authMu.Lock()
 	defer f.authMu.Unlock()
 	if seenGen != f.authGen {
@@ -200,7 +233,7 @@ func (f *Fetcher) refreshAuth(seenGen int, reason string) error {
 			authNeeded: true,
 		}
 	}
-	cookie, err := f.opt.RefreshAuth(reason)
+	cookie, err := f.opt.RefreshAuth(ctx, reason)
 	if err != nil {
 		return &fatalError{msg: "session expired (" + reason + "): " + err.Error(), authNeeded: true}
 	}
@@ -251,9 +284,10 @@ func (f *Fetcher) update(fn func()) {
 	}
 }
 
-// plan decides what this run will do, adopting any stray complete files it
-// finds (e.g. a part the browser already downloaded into the directory).
-func (f *Fetcher) plan() (download, verify []*state.Part, notes []string) {
+// plan decides what this run will do. In dry-run mode it is strictly
+// read-only: nothing is mutated and nothing is saved.
+func (f *Fetcher) plan(dry bool) (download, verify []*state.Part, notes []string) {
+	changed := false
 	f.st.View(func() {
 		for _, p := range f.st.Parts {
 			if f.opt.Only != nil && !f.opt.Only[p.Num] {
@@ -266,39 +300,43 @@ func (f *Fetcher) plan() (download, verify []*state.Part, notes []string) {
 					notes = append(notes, fmt.Sprintf("part %03d is marked done but %s is missing (moved elsewhere?) — leaving it done", p.Num, p.Filename))
 				}
 			case state.Downloaded:
-				if f.opt.FullVerify {
-					verify = append(verify, p)
-				} else {
-					notes = append(notes, fmt.Sprintf("part %03d is downloaded but unverified — run `carryout verify` when convenient", p.Num))
-				}
+				verify = append(verify, p)
 			case state.Corrupt:
 				notes = append(notes, fmt.Sprintf("part %03d failed verification earlier — re-download costs an attempt, requeue explicitly with `carryout get -redo %d`", p.Num, p.Num))
 			case state.Pending, state.Attention:
 				if fi, err := os.Stat(final); err == nil {
-					if kind, kerr := sniff.FileKind(final); kerr == nil && kind != "" {
+					kind, kerr := sniff.FileKind(final)
+					sizeOK := p.ExpectedSize == 0 || fi.Size() == p.ExpectedSize
+					if kerr == nil && kind != "" && sizeOK {
+						// Adopt a complete-looking stray file (e.g. a part the
+						// browser already downloaded) — but never trust it
+						// without full verification.
+						if dry {
+							notes = append(notes, fmt.Sprintf("part %03d: would adopt existing file %s (%s) and verify it", p.Num, p.Filename, HumanBytes(fi.Size())))
+							continue
+						}
 						p.Status = state.Downloaded
 						p.ActualSize = fi.Size()
 						p.LastError = ""
-						notes = append(notes, fmt.Sprintf("part %03d: adopted existing file %s (%s); it will be verified", p.Num, p.Filename, human(fi.Size())))
-						if f.opt.FullVerify {
-							verify = append(verify, p)
-						} else {
-							p.Status = state.Done
-							p.CompletedAt = time.Now().UTC()
-						}
+						changed = true
+						notes = append(notes, fmt.Sprintf("part %03d: adopted existing file %s (%s); it will be fully verified", p.Num, p.Filename, HumanBytes(fi.Size())))
+						verify = append(verify, p)
 						continue
 					}
-					notes = append(notes, fmt.Sprintf("part %03d: existing file %s is not a valid archive; it will be re-downloaded", p.Num, p.Filename))
+					notes = append(notes, fmt.Sprintf("part %03d: existing file %s failed adoption checks (size or magic bytes); it will be re-downloaded", p.Num, p.Filename))
 				}
-				if p.Status == state.Attention {
+				if p.Status == state.Attention && !dry {
 					p.Status = state.Pending
+					changed = true
 				}
 				download = append(download, p)
 			}
 		}
 	})
-	if err := f.st.Save(); err != nil {
-		f.logf("WARNING: could not save %s: %v", state.FileName, err)
+	if changed {
+		if err := f.st.Save(); err != nil {
+			f.logf("WARNING: could not save %s: %v", state.FileName, err)
+		}
 	}
 	sort.Slice(download, func(i, j int) bool { return download[i].Num < download[j].Num })
 	return download, verify, notes
@@ -307,14 +345,14 @@ func (f *Fetcher) plan() (download, verify []*state.Part, notes []string) {
 // Run executes the plan and blocks until done, interrupted, or a fatal error.
 func (f *Fetcher) Run(ctx context.Context) (Summary, error) {
 	start := time.Now()
-	download, verify, notes := f.plan()
+	download, verify, notes := f.plan(f.opt.DryRun)
 	for _, n := range notes {
 		f.logf("%s", n)
 	}
 
 	if f.opt.DryRun {
 		for _, p := range download {
-			f.logf("would download part %03d: GET %s", p.Num, f.tmpl.PartURL(p.Num))
+			f.logf("would download part %03d: GET %s", p.Num, f.tmpl.BuildURL(p.Filename, p.Index))
 		}
 		for _, p := range verify {
 			f.logf("would verify part %03d: %s", p.Num, filepath.Join(f.opt.Dir, p.Filename))
@@ -373,7 +411,9 @@ func (f *Fetcher) Run(ctx context.Context) (Summary, error) {
 				err := f.fetchPart(qctx, ctx, p)
 				switch {
 				case err == nil:
-					if f.opt.FullVerify {
+					needsVerify := false
+					f.st.View(func() { needsVerify = p.Status == state.Downloaded })
+					if needsVerify {
 						verifyQ <- p
 					}
 				case errors.Is(err, errGaveUp):
@@ -388,18 +428,23 @@ func (f *Fetcher) Run(ctx context.Context) (Summary, error) {
 		}()
 	}
 
+	// Two verifiers: with inline verification handling clean downloads, this
+	// queue only sees resumed/adopted/zip parts, but a resumed-heavy run
+	// shouldn't serialize behind one decompressor.
 	var vwg sync.WaitGroup
-	vwg.Add(1)
-	go func() {
-		defer vwg.Done()
-		for p := range verifyQ {
-			// verification is local and free; only a hard abort skips it
-			if ctx.Err() != nil {
-				continue // drain; carryout verify can finish later
+	for range 2 {
+		vwg.Add(1)
+		go func() {
+			defer vwg.Done()
+			for p := range verifyQ {
+				// verification is local and free; only a hard abort skips it
+				if ctx.Err() != nil {
+					continue // drain; carryout verify can finish later
+				}
+				VerifyPartFile(ctx, f.st, f.opt.Dir, p, f.opt.Logf)
 			}
-			f.verifyPart(p)
-		}
-	}()
+		}()
+	}
 
 	wg.Wait()
 	close(verifyQ)
@@ -434,11 +479,15 @@ func (f *Fetcher) summary(start time.Time) Summary {
 func (f *Fetcher) fetchPart(qctx, hctx context.Context, p *state.Part) error {
 	tries := 0
 	throttleWaits := 0
+	firstAuthGen := -1
 	for {
 		if qctx.Err() != nil {
 			return context.Canceled
 		}
 		f.waitCooldown(qctx)
+		if qctx.Err() != nil {
+			return context.Canceled // a fatal halt can land mid-cooldown
+		}
 
 		gen, cookie := f.snapshotAuth()
 		tries++
@@ -447,25 +496,69 @@ func (f *Fetcher) fetchPart(qctx, hctx context.Context, p *state.Part) error {
 			return nil
 		}
 
+		var throttled *throttledError
+		var broken *partBrokenError
 		switch {
 		case errors.Is(err, context.Canceled) || hctx.Err() != nil:
 			return context.Canceled
 
 		case errors.Is(err, errAuthExpired):
 			tries-- // auth failures don't count against the part
+			if firstAuthGen >= 0 && gen > firstAuthGen {
+				// This attempt already ran with cookies newer than the first
+				// failure and still got rejected: fresh auth doesn't help, so
+				// don't loop the prompt — likely the per-part download cap or
+				// an expired link.
+				f.update(func() {
+					p.Status = state.Attention
+					p.LastError = "still rejected with fresh cookies — possible per-part download cap or expired link; check the Takeout page"
+				})
+				f.logf("part %03d: still rejected after a cookie refresh — flagged for attention; continuing with other parts", p.Num)
+				return errGaveUp
+			}
+			if firstAuthGen < 0 {
+				firstAuthGen = gen
+			}
 			f.logf("part %03d: %v — holding the queue for fresh cookies", p.Num, err)
-			if rerr := f.refreshAuth(gen, err.Error()); rerr != nil {
+			if rerr := f.refreshAuth(qctx, gen, err.Error()); rerr != nil {
 				return rerr
 			}
 
-		case errors.Is(err, errThrottled):
+		case errors.As(err, &throttled):
 			tries--
 			throttleWaits++
 			if throttleWaits > 4 {
 				return &fatalError{msg: fmt.Sprintf("part %03d: still throttled after %d cooldowns — stopping so we don't hammer Google; try again later", p.Num, throttleWaits)}
 			}
-			f.logf("part %03d: HTTP 429 — cooling down for %s", p.Num, f.opt.Cooldown)
-			f.setCooldown(f.opt.Cooldown)
+			cool := f.opt.Cooldown
+			if throttled.after > cool {
+				cool = throttled.after
+			}
+			if cool > 30*time.Minute {
+				return &fatalError{msg: fmt.Sprintf("Google asked for a %s back-off (Retry-After) — stopping; try again later", throttled.after)}
+			}
+			f.logf("part %03d: HTTP 429 — cooling down for %s", p.Num, cool)
+			f.setCooldown(cool)
+
+		case errors.Is(err, errNotFound):
+			streak := f.notFoundStreak.Add(1)
+			f.update(func() {
+				p.Status = state.Attention
+				p.LastError = "HTTP 404 — no file at the constructed URL"
+			})
+			if streak >= 3 {
+				return &fatalError{msg: "three parts in a row returned 404 — the export may have expired or the URL mapping is wrong; stopping before more attempts are spent. Re-check the Takeout page, then `carryout init -force` with a fresh capture and file list"}
+			}
+			f.logf("part %03d: HTTP 404 — flagged for attention; continuing (404 streak %d/3)", p.Num, streak)
+			return errGaveUp
+
+		case errors.As(err, &broken):
+			f.update(func() {
+				p.Status = state.Attention
+				p.LastError = broken.msg
+			})
+			f.logf("part %03d: %s — flagged for attention; continuing", p.Num, broken.msg)
+			return errGaveUp
 
 		default:
 			var re *retryableError
@@ -474,7 +567,8 @@ func (f *Fetcher) fetchPart(qctx, hctx context.Context, p *state.Part) error {
 				return err // fatal
 			}
 			if f.authChanged(gen) {
-				continue // failure was collateral damage of a session death; retry free
+				tries-- // collateral damage of a session death; retry free
+				continue
 			}
 			f.update(func() { p.LastError = err.Error() })
 			if tries >= f.opt.MaxTries {
@@ -486,6 +580,52 @@ func (f *Fetcher) fetchPart(qctx, hctx context.Context, p *state.Part) error {
 			sleepCtx(qctx, f.opt.RetryDelay)
 		}
 	}
+}
+
+// classifyHTMLPage decides what an HTML body means: session death pauses the
+// queue; anything else flags the part and, if it keeps happening, stops the
+// run as systemic.
+func (f *Fetcher) classifyHTMLPage(p *state.Part, final string, body []byte) error {
+	if sniff.LooksLikeSignIn(body) {
+		return errAuthExpired
+	}
+	diag := final + ".error.html"
+	_ = os.WriteFile(diag, body, 0644)
+	if n := f.htmlPages.Add(1); n >= 3 {
+		return &fatalError{msg: fmt.Sprintf("multiple parts are getting HTML pages instead of archives (latest saved to %s) — something systemic (expired export? blocked session?); stopping. Open the page in a browser to see what Google says", diag)}
+	}
+	return &partBrokenError{msg: fmt.Sprintf("Google sent an HTML page instead of the archive (saved to %s)", diag)}
+}
+
+// parseContentRange parses "bytes start-end/total". start or total are -1
+// when given as "*". ok is false if the header is absent or malformed.
+func parseContentRange(h string) (start, total int64, ok bool) {
+	h = strings.TrimSpace(h)
+	rest, found := strings.CutPrefix(h, "bytes ")
+	if !found {
+		return 0, 0, false
+	}
+	rangePart, totalStr, found := strings.Cut(rest, "/")
+	if !found {
+		return 0, 0, false
+	}
+	start, total = -1, -1
+	if totalStr != "*" {
+		t, err := strconv.ParseInt(strings.TrimSpace(totalStr), 10, 64)
+		if err != nil {
+			return 0, 0, false
+		}
+		total = t
+	}
+	if rangePart != "*" {
+		startStr, _, _ := strings.Cut(rangePart, "-")
+		s, err := strconv.ParseInt(strings.TrimSpace(startStr), 10, 64)
+		if err != nil {
+			return 0, 0, false
+		}
+		start = s
+	}
+	return start, total, true
 }
 
 // attempt performs one HTTP download attempt for a part.
@@ -501,7 +641,7 @@ func (f *Fetcher) attempt(ctx context.Context, p *state.Part, cookie string) err
 		offset = fi.Size()
 	}
 
-	req, err := http.NewRequestWithContext(actx, http.MethodGet, f.tmpl.PartURL(p.Num), nil)
+	req, err := http.NewRequestWithContext(actx, http.MethodGet, f.tmpl.BuildURL(p.Filename, p.Index), nil)
 	if err != nil {
 		return &fatalError{msg: fmt.Sprintf("part %03d: building request: %v", p.Num, err)}
 	}
@@ -530,9 +670,22 @@ func (f *Fetcher) attempt(ctx context.Context, p *state.Part, cookie string) err
 	case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
 		return fmt.Errorf("%w (HTTP %d)", errAuthExpired, resp.StatusCode)
 	case resp.StatusCode == http.StatusTooManyRequests:
-		return errThrottled
+		return &throttledError{after: parseRetryAfter(resp.Header.Get("Retry-After"))}
 	case resp.StatusCode == http.StatusNotFound:
-		return &fatalError{msg: fmt.Sprintf("part %03d: HTTP 404 — wrong total part count, a changed URL pattern, or an expired export; check the Takeout page", p.Num)}
+		return errNotFound
+	case resp.StatusCode == http.StatusRequestedRangeNotSatisfiable:
+		if offset > 0 {
+			// Usually means the .part is already byte-complete (a crash hit
+			// between the last byte and the rename). Confirm via the total
+			// and finalize instead of re-downloading 50 GiB.
+			if _, total, ok := parseContentRange(resp.Header.Get("Content-Range")); ok && total == offset {
+				f.logf("part %03d: partial file is already complete (%s); finalizing without another download", p.Num, HumanBytes(offset))
+				return f.finalizePart(p, partPath, final, offset, total, false, true)
+			}
+			_ = os.Remove(partPath)
+			return &retryableError{errors.New("server rejected our resume offset (416); discarded the partial file to restart cleanly")}
+		}
+		return &retryableError{errors.New("HTTP 416 without a Range request; retrying")}
 	case resp.StatusCode >= 500:
 		return &retryableError{fmt.Errorf("HTTP %s", resp.Status)}
 	default:
@@ -547,14 +700,32 @@ func (f *Fetcher) attempt(ctx context.Context, p *state.Part, cookie string) err
 		offset = 0
 	}
 
-	// An error page announces itself in the Content-Type header.
-	ct := strings.ToLower(resp.Header.Get("Content-Type"))
-	if strings.Contains(ct, "text/html") || strings.Contains(ct, "application/xhtml") {
-		if resuming {
-			return errAuthExpired
+	var expected int64 = -1
+	if resuming {
+		start, total, ok := parseContentRange(resp.Header.Get("Content-Range"))
+		switch {
+		case !ok:
+			return &retryableError{errors.New("206 response without a parseable Content-Range")}
+		case start == offset:
+			expected = total
+		case start == 0 && total > 0:
+			// Server restarted from scratch despite saying 206: treat it as a
+			// fresh full body rather than appending it after our offset.
+			f.logf("part %03d: server restarted the transfer from byte 0; discarding the resume offset", p.Num)
+			resuming = false
+			offset = 0
+			expected = total
+		default:
+			return &retryableError{fmt.Errorf("Content-Range starts at %d but we asked for %d — refusing to append", start, offset)}
 		}
+	} else if resp.ContentLength > 0 {
+		expected = resp.ContentLength
+	}
+
+	// An error page usually announces itself in the Content-Type header.
+	if sniff.IsHTMLContentType(resp.Header.Get("Content-Type")) {
 		body, _ := io.ReadAll(io.LimitReader(br, 256<<10))
-		return f.htmlPageError(p, final, body)
+		return f.classifyHTMLPage(p, final, body)
 	}
 
 	// Google is serving binary content: count it now, before anything (a
@@ -562,27 +733,39 @@ func (f *Fetcher) attempt(ctx context.Context, p *state.Part, cookie string) err
 	// An interrupted serve plausibly still counts against Takeout's per-part
 	// download limit, so the on-disk counter must never lag Google's.
 	f.recordServed(p, resuming)
+	f.notFoundStreak.Store(0)
 
+	// The wrong-file tripwire: if Google names the file it is serving and
+	// that isn't the file we asked for, the URL mapping is wrong — stop
+	// before recording anything under a false name.
+	if cd := resp.Header.Get("Content-Disposition"); cd != "" {
+		if _, params, err := mime.ParseMediaType(cd); err == nil {
+			if fn := params["filename"]; fn != "" && fn != p.Filename {
+				return &fatalError{msg: fmt.Sprintf("part %03d: asked for %s but Google is serving %q — the filename↔index mapping is wrong; stopping. Re-run `carryout init -force` and paste the export file list", p.Num, p.Filename, fn)}
+			}
+		}
+	}
+
+	kind := ""
 	if !resuming {
+		head, perr := br.Peek(512)
+		if len(head) == 0 {
+			return &retryableError{fmt.Errorf("connection dropped before any body arrived (%v)", perr)}
+		}
 		// Belt and braces: some error pages come mislabeled as binary.
-		head, _ := br.Peek(512)
 		if sniff.IsHTML("", head) {
 			body, _ := io.ReadAll(io.LimitReader(br, 256<<10))
-			return f.htmlPageError(p, final, body)
+			return f.classifyHTMLPage(p, final, body)
 		}
-		if sniff.Kind(head) == "" {
+		kind = sniff.Kind(head)
+		if kind == "" {
+			if perr != nil {
+				return &retryableError{fmt.Errorf("connection dropped mid-header (%v)", perr)}
+			}
 			return &fatalError{msg: fmt.Sprintf("part %03d: response is not a recognized archive (starts with % x) — refusing to write it", p.Num, head[:min(8, len(head))])}
 		}
 	}
 
-	var expected int64 = -1
-	if resuming {
-		if total, ok := contentRangeTotal(resp.Header.Get("Content-Range")); ok {
-			expected = total
-		}
-	} else if resp.ContentLength > 0 {
-		expected = resp.ContentLength
-	}
 	if expected > 0 {
 		f.update(func() { p.ExpectedSize = expected })
 	}
@@ -603,6 +786,19 @@ func (f *Fetcher) attempt(ctx context.Context, p *state.Part, cookie string) err
 			file.Close()
 		}
 	}()
+
+	// Inline verification: for a fresh gzip body, decompress alongside the
+	// write so a clean download is fully verified with zero extra disk reads.
+	// Quick mode skips it unless the length is unknown (then it's the only
+	// truncation detector we have).
+	var verifier *sniff.StreamVerifier
+	if kind == "gzip" && (f.opt.FullVerify || expected <= 0) {
+		verifier = sniff.NewGzipStreamVerifier()
+	}
+	var dst io.Writer = file
+	if verifier != nil {
+		dst = io.MultiWriter(file, verifier)
+	}
 
 	prog := f.trackPart(p.Num, offset, expected)
 	defer f.untrackPart(p.Num)
@@ -631,7 +827,8 @@ func (f *Fetcher) attempt(ctx context.Context, p *state.Part, cookie string) err
 		}
 	}()
 
-	n, cerr := io.Copy(file, &progressReader{r: br, f: f, prog: prog})
+	copyBuf := make([]byte, 1<<20)
+	n, cerr := io.CopyBuffer(dst, &progressReader{r: br, f: f, prog: prog}, copyBuf)
 	if serr := file.Sync(); cerr == nil && serr != nil {
 		cerr = serr
 	}
@@ -640,23 +837,57 @@ func (f *Fetcher) attempt(ctx context.Context, p *state.Part, cookie string) err
 		cerr = clErr
 	}
 	if cerr != nil {
+		if verifier != nil {
+			verifier.Abort()
+		}
 		if errors.Is(context.Cause(actx), errStalled) {
 			return &retryableError{fmt.Errorf("stalled: no data for %s", f.opt.StallTimeout)}
 		}
 		if ctx.Err() != nil {
 			return context.Canceled
 		}
-		return &retryableError{fmt.Errorf("transfer failed after %s: %w", human(n), cerr)}
+		return &retryableError{fmt.Errorf("transfer failed after %s: %w", HumanBytes(n), cerr)}
 	}
 
 	size := offset + n
 	if expected > 0 && size != expected {
-		if size < expected {
-			return &retryableError{fmt.Errorf("short download: got %s of %s (will resume)", human(size), human(expected))}
+		if verifier != nil {
+			verifier.Abort()
 		}
-		return &fatalError{msg: fmt.Sprintf("part %03d: downloaded %s but expected %s — refusing to trust it", p.Num, human(size), human(expected))}
+		if size < expected {
+			return &retryableError{fmt.Errorf("short download: got %s of %s (will resume)", HumanBytes(size), HumanBytes(expected))}
+		}
+		return &fatalError{msg: fmt.Sprintf("part %03d: downloaded %s but expected %s — refusing to trust it", p.Num, HumanBytes(size), HumanBytes(expected))}
 	}
 
+	inlineOK := false
+	if verifier != nil {
+		if verr := verifier.Finish(); verr != nil {
+			// The bytes are what Google sent; keep them for inspection but
+			// record the part as corrupt.
+			_ = os.Remove(final)
+			_ = os.Rename(partPath, final)
+			f.update(func() {
+				p.ActualSize = size
+				p.Status = state.Corrupt
+				p.LastError = "inline verification failed: " + verr.Error()
+			})
+			f.logf("part %03d: VERIFICATION FAILED during download: %v — file kept at %s; requeue with `carryout get -redo %d`", p.Num, verr, final, p.Num)
+			return nil
+		}
+		inlineOK = true
+	}
+
+	// A resumed download stitched two transfers together; never trust it on
+	// size alone, even in quick mode.
+	return f.finalizePart(p, partPath, final, size, expected, inlineOK, resuming)
+}
+
+// finalizePart moves a byte-complete .part into place and records its status:
+// Done when verified (inline) or when quick mode's checks suffice, Downloaded
+// (= verification pending) otherwise. requireVerify forces the Downloaded
+// path for bytes we didn't watch arrive end-to-end.
+func (f *Fetcher) finalizePart(p *state.Part, partPath, final string, size, expected int64, inlineVerified, requireVerify bool) error {
 	// Quick check on the assembled file (catches a garbage head from an
 	// earlier interrupted attempt that we then resumed on top of).
 	if kind, kerr := sniff.FileKind(partPath); kerr != nil || kind == "" {
@@ -664,39 +895,55 @@ func (f *Fetcher) attempt(ctx context.Context, p *state.Part, cookie string) err
 		return &retryableError{errors.New("assembled file is not a valid archive; discarded it to restart cleanly")}
 	}
 
+	// Windows can't always rename over an existing file; clear leftovers.
+	_ = os.Remove(final)
 	if err := os.Rename(partPath, final); err != nil {
 		return &fatalError{msg: fmt.Sprintf("part %03d: renaming into place: %v", p.Num, err)}
 	}
 
 	now := time.Now().UTC()
+	status := state.Downloaded
+	note := " (verification queued)"
+	switch {
+	case inlineVerified:
+		status = state.Done
+		note = " (verified inline)"
+	case requireVerify:
+		// keep Downloaded
+	case !f.opt.FullVerify && expected > 0 && size == expected:
+		status = state.Done
+		note = " (size matches; quick mode)"
+	}
 	f.update(func() {
 		p.ActualSize = size
+		if expected > 0 {
+			p.ExpectedSize = expected
+		}
 		p.CompletedAt = now
 		p.LastError = ""
-		if f.opt.FullVerify {
-			p.Status = state.Downloaded
-		} else {
-			p.Status = state.Done
+		p.Status = status
+		if inlineVerified {
+			p.VerifiedAt = now
 		}
 	})
-	sizeNote := ""
-	if expected > 0 {
-		sizeNote = " (size matches Content-Length)"
-	}
-	f.logf("part %03d: downloaded %s%s", p.Num, human(size), sizeNote)
+	f.logf("part %03d: downloaded %s%s", p.Num, HumanBytes(size), note)
 	return nil
 }
 
-// htmlPageError classifies an HTML body: session death pauses the queue,
-// anything else (quota page, unknown error) stops the run with the page saved
-// for the user to read.
-func (f *Fetcher) htmlPageError(p *state.Part, final string, body []byte) error {
-	if sniff.LooksLikeSignIn(body) {
-		return errAuthExpired
+func parseRetryAfter(h string) time.Duration {
+	h = strings.TrimSpace(h)
+	if h == "" {
+		return 0
 	}
-	diag := final + ".error.html"
-	_ = os.WriteFile(diag, body, 0644)
-	return &fatalError{msg: fmt.Sprintf("part %03d: Google sent an HTML page instead of the archive (saved to %s) — open it in a browser to see why, then re-run `carryout get`", p.Num, diag)}
+	if secs, err := strconv.Atoi(h); err == nil && secs >= 0 {
+		return time.Duration(secs) * time.Second
+	}
+	if t, err := http.ParseTime(h); err == nil {
+		if d := time.Until(t); d > 0 {
+			return d
+		}
+	}
+	return 0
 }
 
 func (f *Fetcher) recordServed(p *state.Part, resuming bool) {
@@ -711,29 +958,48 @@ func (f *Fetcher) recordServed(p *state.Part, resuming bool) {
 	}
 	f.logf("part %03d: %s started (served download #%d for this part)", p.Num, kind, attempts)
 	if attempts >= f.opt.AttemptWarnAt {
-		f.logf("part %03d: WARNING — Google has served this part %d times; Takeout is believed to limit downloads per part", p.Num, attempts)
+		f.logf("part %03d: WARNING — Google has served this part %d times (including any browser downloads); Takeout is believed to limit downloads per part", p.Num, attempts)
 	}
 }
 
-func (f *Fetcher) verifyPart(p *state.Part) {
-	path := filepath.Join(f.opt.Dir, p.Filename)
-	f.logf("part %03d: verifying %s (%s)…", p.Num, p.Filename, human(p.ActualSize))
+// VerifyPartFile fully verifies one part's file on disk and records the
+// verdict in state. Shared by the in-run verifiers and `carryout verify` so
+// the two can't drift. Returns true when the part verified clean.
+func VerifyPartFile(ctx context.Context, st *state.State, dir string, p *state.Part, logf func(string, ...any)) bool {
+	path := filepath.Join(dir, p.Filename)
+	logf("part %03d: verifying %s (%s)…", p.Num, p.Filename, HumanBytes(p.ActualSize))
 	start := time.Now()
-	if err := sniff.VerifyFile(path); err != nil {
-		f.update(func() {
+	if err := sniff.VerifyFile(ctx, path); err != nil {
+		if ctx.Err() != nil {
+			logf("part %03d: verification interrupted — `carryout verify` will finish it", p.Num)
+			return false
+		}
+		update(st, logf, func() {
 			p.Status = state.Corrupt
 			p.LastError = "verification failed: " + err.Error()
 		})
-		f.logf("part %03d: VERIFICATION FAILED: %v — file kept at %s; requeue with `carryout get -redo %d`", p.Num, err, path, p.Num)
-		return
+		logf("part %03d: VERIFICATION FAILED: %v — file kept at %s; requeue with `carryout get -redo %d`", p.Num, err, path, p.Num)
+		return false
 	}
 	now := time.Now().UTC()
-	f.update(func() {
+	update(st, logf, func() {
 		p.Status = state.Done
 		p.VerifiedAt = now
 		p.LastError = ""
+		if p.ActualSize == 0 {
+			if fi, err := os.Stat(path); err == nil {
+				p.ActualSize = fi.Size()
+			}
+		}
 	})
-	f.logf("part %03d: verified OK in %s", p.Num, time.Since(start).Round(time.Second))
+	logf("part %03d: verified OK in %s", p.Num, time.Since(start).Round(time.Second))
+	return true
+}
+
+func update(st *state.State, logf func(string, ...any), fn func()) {
+	if err := st.Update(fn); err != nil {
+		logf("WARNING: could not save %s: %v", state.FileName, err)
+	}
 }
 
 type progressReader struct {
@@ -804,12 +1070,12 @@ func (f *Fetcher) report(ctx context.Context, done chan<- struct{}) {
 			if a.exp > 0 {
 				parts = append(parts, fmt.Sprintf("part %03d %d%%", a.num, a.cur*100/a.exp))
 			} else {
-				parts = append(parts, fmt.Sprintf("part %03d %s", a.num, human(a.cur)))
+				parts = append(parts, fmt.Sprintf("part %03d %s", a.num, HumanBytes(a.cur)))
 			}
 		}
 		_, _, doneN, _, _, doneBytes := f.st.Counts()
 		line := fmt.Sprintf("%s · %s/s · done %d/%d (%s) · this run %s",
-			strings.Join(parts, " · "), human(int64(speed)), doneN, f.st.TotalParts, human(doneBytes), human(cur))
+			strings.Join(parts, " · "), HumanBytes(int64(speed)), doneN, f.st.TotalParts, HumanBytes(doneBytes), HumanBytes(cur))
 
 		if eta, ok := f.eta(speed); ok {
 			line += " · ETA " + eta
@@ -818,37 +1084,16 @@ func (f *Fetcher) report(ctx context.Context, done chan<- struct{}) {
 	}
 }
 
-// eta estimates time remaining from known expected sizes (or the average of
-// completed parts where unknown) at the current transfer speed.
+// eta estimates time remaining from the shared state estimator at the current
+// transfer speed, minus what active transfers already have on disk.
 func (f *Fetcher) eta(speed float64) (string, bool) {
 	if speed <= 0 {
 		return "", false
 	}
-	var remaining int64
-	var doneBytes, doneCount int64
-	unknown := 0
-	f.st.View(func() {
-		for _, p := range f.st.Parts {
-			switch p.Status {
-			case state.Done, state.Downloaded:
-				doneBytes += p.ActualSize
-				doneCount++
-			default:
-				if p.ExpectedSize > 0 {
-					remaining += p.ExpectedSize
-				} else {
-					unknown++
-				}
-			}
-		}
-	})
-	if unknown > 0 {
-		if doneCount == 0 {
-			return "", false
-		}
-		remaining += int64(unknown) * (doneBytes / doneCount)
+	remaining, ok := f.st.RemainingEstimate()
+	if !ok {
+		return "", false
 	}
-	// subtract what active transfers already have on disk
 	f.progMu.Lock()
 	for _, p := range f.progress {
 		remaining -= p.cur.Load()
@@ -864,24 +1109,9 @@ func (f *Fetcher) eta(speed float64) (string, bool) {
 	return d.Round(time.Minute).String(), true
 }
 
-func contentRangeTotal(h string) (int64, bool) {
-	// "bytes start-end/total"
-	h = strings.TrimSpace(h)
-	if !strings.HasPrefix(h, "bytes ") {
-		return 0, false
-	}
-	_, totalStr, ok := strings.Cut(h[len("bytes "):], "/")
-	if !ok || totalStr == "*" {
-		return 0, false
-	}
-	total, err := strconv.ParseInt(totalStr, 10, 64)
-	if err != nil {
-		return 0, false
-	}
-	return total, true
-}
-
-func human(n int64) string {
+// HumanBytes formats a byte count in IEC units. Exported so the CLI and this
+// package can't drift apart in how they render the same numbers.
+func HumanBytes(n int64) string {
 	const unit = 1024
 	if n < unit {
 		return fmt.Sprintf("%d B", n)

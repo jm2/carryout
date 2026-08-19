@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 // carryout picks up your Google Takeout order: give it one copied-as-cURL
-// download request and it fetches every archive part, verifies each one, and
-// keeps going until the whole export is on disk.
+// download request plus the export's file list and it fetches every archive
+// part, verifies each one, and keeps going until the whole export is on disk.
 package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"flag"
@@ -14,6 +15,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -23,29 +25,28 @@ import (
 
 	"github.com/jm2/carryout/internal/curlcmd"
 	"github.com/jm2/carryout/internal/fetch"
-	"github.com/jm2/carryout/internal/sniff"
 	"github.com/jm2/carryout/internal/state"
 	"github.com/jm2/carryout/internal/takeout"
 )
 
-const version = "0.1.0"
+const version = "0.2.0"
 
 const usageText = `carryout — picks up your Google Takeout order
 
 Google Takeout hands you a multi-terabyte export as dozens of 50 GiB archives
 behind expiring links and a session that dies every few files. carryout
-downloads all of them from one pasted browser capture: it constructs every
-part URL, fetches with a few parallel workers, verifies each archive, halts
-the moment your session dies (so no download attempts are wasted), and
-resumes where it left off.
+downloads all of them from one pasted browser capture plus the export's file
+list: it constructs every part URL, fetches with a few parallel workers,
+verifies each archive, halts the moment your session dies (so no download
+attempts are wasted), and resumes where it left off.
 
 Usage:
   carryout <command> [flags]
 
 Commands:
-  init      Register an export from a pasted "Copy as cURL" capture
+  init      Register an export from a cURL capture + the page's file list
   get       Download and verify all remaining parts (safe to re-run)
-  status    Show per-part progress, sizes, and attempt counts
+  status    Show per-part progress, sizes, and serve counts
   verify    Run full integrity verification on downloaded parts
   auth      Update session cookies from a fresh capture
   version   Print version
@@ -53,7 +54,7 @@ Commands:
 Run 'carryout <command> -h' for flags. Typical first session:
 
   cd /big/disk/takeout
-  carryout init            # paste the capture, enter the part count
+  carryout init            # paste the capture, then the file list
   carryout get -dry-run    # eyeball every URL it will hit
   carryout get -only 1     # end-to-end test on one part
   carryout get             # fetch everything
@@ -110,6 +111,18 @@ func main() {
 	}
 }
 
+// parseFlags wraps FlagSet.Parse so a usage typo exits 1 (flag.ExitOnError
+// would exit 2, colliding with 2 = "session expired, run carryout auth").
+func parseFlags(fs *flag.FlagSet, args []string) error {
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return &exitErr{code: 0}
+		}
+		return &exitErr{code: 1} // flag package already printed the error
+	}
+	return nil
+}
+
 func logf(format string, args ...any) {
 	fmt.Printf(time.Now().Format("15:04:05")+"  "+format+"\n", args...)
 }
@@ -117,13 +130,16 @@ func logf(format string, args ...any) {
 // ---- init ----
 
 func cmdInit(args []string) error {
-	fs := flag.NewFlagSet("init", flag.ExitOnError)
+	fs := flag.NewFlagSet("init", flag.ContinueOnError)
 	dir := fs.String("dir", ".", "directory to download into (state lives here too)")
 	curlFile := fs.String("curl-file", "", "read the cURL capture from this file instead of prompting")
-	parts := fs.Int("parts", 0, "total number of archive parts (shown on the Takeout page)")
+	manifestFile := fs.String("manifest-file", "", "read the export's file list (pasted Takeout page text) from this file")
+	parts := fs.Int("parts", 0, "total part count — ONLY for simple single-sequence exports; grouped exports need the file list")
 	verifyMode := fs.String("verify", "full", "verification mode: full (decompress and check every byte) or quick (magic bytes + size)")
 	force := fs.Bool("force", false, "overwrite an existing carryout.json")
-	fs.Parse(args)
+	if err := parseFlags(fs, args); err != nil {
+		return err
+	}
 
 	if *verifyMode != "full" && *verifyMode != "quick" {
 		return fmt.Errorf("-verify must be full or quick, not %q", *verifyMode)
@@ -131,24 +147,18 @@ func cmdInit(args []string) error {
 	if state.Exists(*dir) && !*force {
 		return fmt.Errorf("%s already exists — use `carryout get` to resume, or -force to start over", state.Path(*dir))
 	}
+	release, err := acquireLock(*dir)
+	if err != nil {
+		return err
+	}
+	defer release()
 
 	in := bufio.NewReader(os.Stdin)
-	var text string
-	if *curlFile != "" {
-		b, err := os.ReadFile(*curlFile)
-		if err != nil {
-			return err
-		}
-		text = string(b)
-	} else {
-		fmt.Println(`Paste the "Copy as cURL" capture of one part download (the request to`)
-		fmt.Println(`takeout-download…usercontent.google.com), then press Enter on a blank line:`)
-		fmt.Println()
-		var err error
-		text, err = readPaste(in)
-		if err != nil {
-			return err
-		}
+	text, err := readCapture(in, *curlFile,
+		`Paste the "Copy as cURL" capture of one part download (the request to
+takeout-download…usercontent.google.com), then press Enter on a blank line:`)
+	if err != nil {
+		return err
 	}
 
 	capture, err := curlcmd.Parse(text)
@@ -159,31 +169,39 @@ func cmdInit(args []string) error {
 	if err != nil {
 		return err
 	}
+	if err := tmpl.SelfCheck(); err != nil {
+		return err
+	}
 	cookie := capture.Headers.Get("Cookie")
 	if cookie == "" {
 		return errors.New("the capture has no Cookie header — copy the cURL for the request your logged-in browser made")
 	}
 
-	total := *parts
-	for total < 1 {
-		n, err := promptInt(in, "How many archive parts does the export have (shown on the Takeout page)? ")
-		if err != nil {
-			return err
-		}
-		total = n
+	entries, err := readInventory(in, tmpl, *manifestFile, *parts)
+	if err != nil {
+		return err
 	}
-	if tmpl.CapturedNum > total {
-		return fmt.Errorf("the capture is for part %d but you said the export has %d parts", tmpl.CapturedNum, total)
+	if err := takeout.Calibrate(entries, tmpl); err != nil {
+		return err
 	}
 
 	st := state.New(*dir)
 	st.CapturedURL = capture.URL
 	st.JobID = tmpl.JobID
-	st.TotalParts = total
+	st.TotalParts = len(entries)
 	st.VerifyMode = *verifyMode
 	st.Headers = replayHeaders(capture.Headers)
-	for n := 1; n <= total; n++ {
-		st.Parts = append(st.Parts, &state.Part{Num: n, Filename: tmpl.Filename(n), Status: state.Pending})
+	seeded := 0
+	for i, e := range entries {
+		if !takeout.ValidFilename(e.Filename) {
+			return fmt.Errorf("unsafe filename in inventory: %q", e.Filename)
+		}
+		p := &state.Part{Num: i + 1, Filename: e.Filename, Index: e.Index, Status: state.Pending}
+		if e.Downloaded > 0 {
+			p.Attempts = e.Downloaded
+			seeded++
+		}
+		st.Parts = append(st.Parts, p)
 	}
 	if err := state.SaveCookie(*dir, cookie); err != nil {
 		return err
@@ -194,33 +212,80 @@ func cmdInit(args []string) error {
 
 	fmt.Println()
 	if st.JobID != "" {
-		fmt.Printf("Registered export job %s: %d parts\n", st.JobID, total)
+		fmt.Printf("Registered export job %s: %s\n", st.JobID, takeout.GroupSummary(entries))
 	} else {
-		fmt.Printf("Registered export: %d parts\n", total)
+		fmt.Printf("Registered export: %s\n", takeout.GroupSummary(entries))
 	}
-	if tmpl.HasIndex {
-		fmt.Printf("  captured part %0*d ↔ i=%d (offset %+d, measured from your capture)\n",
-			tmpl.NumWidth, tmpl.CapturedNum, tmpl.CapturedNum-tmpl.Offset, tmpl.Offset)
-	} else {
+	for i, e := range entries {
+		if e.Filename == tmpl.CapturedName {
+			if tmpl.HasIndex {
+				fmt.Printf("  calibrated on your capture: %s = list position %d ↔ i=%d\n", e.Filename, i+1, e.Index)
+			}
+			break
+		}
+	}
+	if !tmpl.HasIndex {
 		fmt.Println("  note: no i= index parameter in the captured URL; part URLs will vary only by filename")
 	}
-	fmt.Printf("  first: %s\n", tmpl.PartURL(1))
-	fmt.Printf("  last:  %s\n", tmpl.PartURL(total))
-	fmt.Printf("  cookies: %s (0600)   state: %s\n", state.CookiePath(*dir), state.Path(*dir))
+	if seeded > 0 {
+		fmt.Printf("  seeded served-download counts from the page for %d part(s)\n", seeded)
+	}
+	fmt.Printf("  first: %s\n", tmpl.BuildURL(entries[0].Filename, entries[0].Index))
+	last := entries[len(entries)-1]
+	fmt.Printf("  last:  %s\n", tmpl.BuildURL(last.Filename, last.Index))
+	cookieNote := " (0600)"
+	if runtime.GOOS == "windows" {
+		cookieNote = " (restrict access to this file yourself — Windows file permissions are not set)"
+	}
+	fmt.Printf("  cookies: %s%s   state: %s\n", state.CookiePath(*dir), cookieNote, state.Path(*dir))
 	fmt.Println()
 	fmt.Println("Next:")
 	fmt.Println("  carryout get -dry-run    # review every URL before anything is fetched")
 	fmt.Println("  carryout get -only 1     # end-to-end test on the first part")
+	if takeout.GroupSummaryIsGrouped(entries) {
+		fmt.Println("  (grouped export: also spot-check one part from another group, e.g. -only " + strconv.Itoa(len(entries)) + ")")
+	}
 	fmt.Println("  carryout get             # fetch everything")
 	return nil
 }
 
+// readInventory obtains the export's file list: from -manifest-file, from
+// -parts synthesis (simple exports only), or interactively.
+func readInventory(in *bufio.Reader, tmpl *takeout.Template, manifestFile string, parts int) ([]takeout.Entry, error) {
+	if manifestFile != "" {
+		b, err := os.ReadFile(manifestFile)
+		if err != nil {
+			return nil, err
+		}
+		return takeout.ParseInventory(string(b))
+	}
+	if parts > 0 {
+		return takeout.Synthesize(tmpl, parts)
+	}
+	fmt.Println()
+	fmt.Println(`Now the file list. On the Takeout page, select and copy the export summary
+(the block listing every takeout-…tgz file), paste it here, and press Enter on
+a blank line. For a simple single-sequence export you can instead type just
+the part count:`)
+	fmt.Println()
+	paste, err := readPaste(in)
+	if err != nil {
+		return nil, err
+	}
+	if n, aerr := strconv.Atoi(strings.TrimSpace(paste)); aerr == nil && n > 0 {
+		return takeout.Synthesize(tmpl, n)
+	}
+	return takeout.ParseInventory(paste)
+}
+
 // replayHeaders keeps the browser's headers so replayed requests look exactly
 // like the session that captured them, minus anything that would interfere
-// with resumable bulk downloads.
+// with resumable bulk downloads — and minus credentials, which never belong
+// in the world-readable state file.
 func replayHeaders(h map[string][]string) map[string]string {
 	drop := map[string]bool{
-		"cookie": true, "range": true, "if-range": true, "if-modified-since": true,
+		"cookie": true, "authorization": true, "proxy-authorization": true,
+		"range": true, "if-range": true, "if-modified-since": true,
 		"if-none-match": true, "accept-encoding": true, "content-length": true,
 		"host": true, "connection": true, "te": true, "transfer-encoding": true,
 	}
@@ -229,7 +294,8 @@ func replayHeaders(h map[string][]string) map[string]string {
 		if drop[strings.ToLower(k)] || len(vs) == 0 {
 			continue
 		}
-		out[k] = vs[0]
+		// repeated headers are rare but legitimate; preserve every value
+		out[k] = strings.Join(vs, ", ")
 	}
 	return out
 }
@@ -237,18 +303,20 @@ func replayHeaders(h map[string][]string) map[string]string {
 // ---- get ----
 
 func cmdGet(args []string) error {
-	fs := flag.NewFlagSet("get", flag.ExitOnError)
+	fs := flag.NewFlagSet("get", flag.ContinueOnError)
 	dir := fs.String("dir", ".", "download directory (where carryout init ran)")
 	workers := fs.Int("workers", 3, "parallel downloads (keep this modest)")
 	maxTries := fs.Int("max-tries", 2, "attempts per part per run before flagging it for attention")
 	only := fs.String("only", "", "limit to these parts, e.g. \"1\" or \"3,7-9\"")
 	redo := fs.String("redo", "", "reset these parts and re-download them (deletes their files; costs an attempt)")
-	dryRun := fs.Bool("dry-run", false, "print what would be fetched without touching the network")
+	dryRun := fs.Bool("dry-run", false, "print what would be fetched without touching the network or state")
 	noPrompt := fs.Bool("no-prompt", false, "never prompt for cookies; exit 2 when the session dies")
 	stall := fs.Duration("stall-timeout", 2*time.Minute, "abort an attempt when no data arrives for this long")
 	retryDelay := fs.Duration("retry-delay", 30*time.Second, "wait between retries of a failed part")
 	verifyFlag := fs.String("verify", "", "override verification mode for this run: full or quick")
-	fs.Parse(args)
+	if err := parseFlags(fs, args); err != nil {
+		return err
+	}
 
 	st, err := state.Load(*dir)
 	if err != nil {
@@ -321,7 +389,7 @@ func cmdGet(args []string) error {
 
 	if !*dryRun {
 		fmt.Println()
-		fmt.Printf("this run: %s in %s\n", humanBytes(sum.BytesThisRun), sum.Elapsed)
+		fmt.Printf("this run: %s in %s\n", fetch.HumanBytes(sum.BytesThisRun), sum.Elapsed)
 		fmt.Printf("export:   %d done · %d downloaded (unverified) · %d pending · %d attention · %d corrupt (of %d)\n",
 			sum.Done, sum.Downloaded, sum.Pending, sum.Attention, sum.Corrupt, st.TotalParts)
 	}
@@ -332,13 +400,31 @@ func cmdGet(args []string) error {
 		}
 		return runErr
 	}
-	if sum.Attention > 0 || sum.Corrupt > 0 {
-		return &exitErr{code: 3, err: fmt.Errorf("%d part(s) need attention — see `carryout status`", sum.Attention+sum.Corrupt)}
+	// exit code reflects only the parts this run was asked about
+	if att, cor := selectionIssues(st, onlySet); att+cor > 0 {
+		return &exitErr{code: 3, err: fmt.Errorf("%d part(s) need attention — see `carryout status`", att+cor)}
 	}
 	if sum.Complete() {
 		fmt.Println("all parts downloaded and verified — your order is picked up ✔")
 	}
 	return nil
+}
+
+func selectionIssues(st *state.State, only map[int]bool) (attention, corrupt int) {
+	st.View(func() {
+		for _, p := range st.Parts {
+			if only != nil && !only[p.Num] {
+				continue
+			}
+			switch p.Status {
+			case state.Attention:
+				attention++
+			case state.Corrupt:
+				corrupt++
+			}
+		}
+	})
+	return
 }
 
 func applyRedo(st *state.State, dir string, redoSet map[int]bool, dryRun bool) error {
@@ -379,7 +465,7 @@ func applyRedo(st *state.State, dir string, redoSet map[int]bool, dryRun bool) e
 	return nil
 }
 
-func promptRefreshAuth(reason string) (string, error) {
+func promptRefreshAuth(ctx context.Context, reason string) (string, error) {
 	fmt.Println()
 	fmt.Println("================================================================")
 	fmt.Println("  Google session expired: " + reason)
@@ -392,11 +478,25 @@ func promptRefreshAuth(reason string) (string, error) {
 	fmt.Println("  Paste the cURL command (or just the cookie string) below,")
 	fmt.Println("  then press Enter on a blank line. Ctrl-C aborts (state is saved).")
 	fmt.Println("================================================================")
-	text, err := readPaste(bufio.NewReader(os.Stdin))
-	if err != nil {
-		return "", fmt.Errorf("%v — run `carryout auth`, then `carryout get` to resume", err)
+
+	type pasteResult struct {
+		text string
+		err  error
 	}
-	return curlcmd.CookieFromPaste(text)
+	ch := make(chan pasteResult, 1)
+	go func() {
+		t, e := readPaste(bufio.NewReader(os.Stdin))
+		ch <- pasteResult{t, e}
+	}()
+	select {
+	case <-ctx.Done():
+		return "", errors.New("interrupted while waiting for cookies — run `carryout auth`, then `carryout get` to resume")
+	case r := <-ch:
+		if r.err != nil {
+			return "", fmt.Errorf("%v — run `carryout auth`, then `carryout get` to resume", r.err)
+		}
+		return curlcmd.CookieFromPaste(r.text)
+	}
 }
 
 func warnDiskSpace(st *state.State, dir string) {
@@ -404,38 +504,24 @@ func warnDiskSpace(st *state.State, dir string) {
 	if !ok {
 		return
 	}
-	var remaining, doneBytes, doneCount int64
-	unknown := 0
-	st.View(func() {
-		for _, p := range st.Parts {
-			switch p.Status {
-			case state.Done, state.Downloaded:
-				doneBytes += p.ActualSize
-				doneCount++
-			default:
-				if p.ExpectedSize > 0 {
-					remaining += p.ExpectedSize
-				} else {
-					unknown++
-				}
-			}
-		}
-	})
-	if unknown > 0 && doneCount > 0 {
-		remaining += int64(unknown) * (doneBytes / doneCount)
+	remaining, ok := st.RemainingEstimate()
+	if !ok || remaining <= 0 {
+		return
 	}
-	if remaining > 0 && free < uint64(remaining) {
-		logf("WARNING: ~%s still to download but only %s free on this filesystem", humanBytes(remaining), humanBytes(int64(free)))
+	if free < uint64(remaining) {
+		logf("WARNING: ~%s still to download but only %s free on this filesystem", fetch.HumanBytes(remaining), fetch.HumanBytes(int64(free)))
 	}
 }
 
 // ---- status ----
 
 func cmdStatus(args []string) error {
-	fs := flag.NewFlagSet("status", flag.ExitOnError)
+	fs := flag.NewFlagSet("status", flag.ContinueOnError)
 	dir := fs.String("dir", ".", "download directory")
 	verbose := fs.Bool("v", false, "show every part (default: only parts that aren't done)")
-	fs.Parse(args)
+	if err := parseFlags(fs, args); err != nil {
+		return err
+	}
 
 	st, err := state.Load(*dir)
 	if err != nil {
@@ -453,7 +539,7 @@ func cmdStatus(args []string) error {
 	fmt.Println()
 
 	w := tabwriter.NewWriter(os.Stdout, 2, 4, 2, ' ', 0)
-	fmt.Fprintln(w, "PART\tSTATUS\tSIZE\tSERVED\tNOTE")
+	fmt.Fprintln(w, "PART\tFILE\tSTATUS\tSIZE\tSERVED\tNOTE")
 	shown := 0
 	st.View(func() {
 		for _, p := range st.Parts {
@@ -464,20 +550,20 @@ func cmdStatus(args []string) error {
 			size := "-"
 			switch {
 			case p.ActualSize > 0 && p.ExpectedSize > 0:
-				size = fmt.Sprintf("%s / %s", humanBytes(p.ActualSize), humanBytes(p.ExpectedSize))
+				size = fmt.Sprintf("%s / %s", fetch.HumanBytes(p.ActualSize), fetch.HumanBytes(p.ExpectedSize))
 			case p.ActualSize > 0:
-				size = humanBytes(p.ActualSize)
+				size = fetch.HumanBytes(p.ActualSize)
 			case p.ExpectedSize > 0:
-				size = "? / " + humanBytes(p.ExpectedSize)
+				size = "? / " + fetch.HumanBytes(p.ExpectedSize)
 			}
 			note := p.LastError
 			if p.Status == state.Done && !p.VerifiedAt.IsZero() {
 				note = "verified"
 			}
-			if len(note) > 60 {
-				note = note[:57] + "..."
+			if r := []rune(note); len(r) > 60 {
+				note = string(r[:57]) + "..."
 			}
-			fmt.Fprintf(w, "%03d\t%s\t%s\t%d\t%s\n", p.Num, p.Status, size, p.Attempts, note)
+			fmt.Fprintf(w, "%03d\t%s\t%s\t%s\t%d\t%s\n", p.Num, p.Filename, p.Status, size, p.Attempts, note)
 		}
 	})
 	if shown > 0 {
@@ -487,7 +573,7 @@ func cmdStatus(args []string) error {
 	pending, downloaded, done, attention, corrupt, doneBytes := st.Counts()
 	fmt.Println()
 	fmt.Printf("%d/%d done (%s on disk) · %d downloaded-unverified · %d pending · %d attention · %d corrupt\n",
-		done, st.TotalParts, humanBytes(doneBytes), downloaded, pending, attention, corrupt)
+		done, st.TotalParts, fetch.HumanBytes(doneBytes), downloaded, pending, attention, corrupt)
 	if !*verbose && shown == 0 && done == st.TotalParts {
 		fmt.Println("everything is downloaded and verified ✔")
 	}
@@ -497,10 +583,12 @@ func cmdStatus(args []string) error {
 // ---- verify ----
 
 func cmdVerify(args []string) error {
-	fs := flag.NewFlagSet("verify", flag.ExitOnError)
+	fs := flag.NewFlagSet("verify", flag.ContinueOnError)
 	dir := fs.String("dir", ".", "download directory")
 	all := fs.Bool("all", false, "re-verify every part with a file on disk, even already-verified ones")
-	fs.Parse(args)
+	if err := parseFlags(fs, args); err != nil {
+		return err
+	}
 
 	st, err := state.Load(*dir)
 	if err != nil {
@@ -511,6 +599,9 @@ func cmdVerify(args []string) error {
 		return err
 	}
 	defer release()
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
 	var targets []*state.Part
 	st.View(func() {
@@ -531,29 +622,12 @@ func cmdVerify(args []string) error {
 
 	corrupt := 0
 	for _, p := range targets {
-		path := filepath.Join(*dir, p.Filename)
-		logf("part %03d: verifying %s (%s)…", p.Num, p.Filename, humanBytes(p.ActualSize))
-		if err := sniff.VerifyFile(path); err != nil {
-			corrupt++
-			st.Update(func() {
-				p.Status = state.Corrupt
-				p.LastError = "verification failed: " + err.Error()
-			})
-			logf("part %03d: VERIFICATION FAILED: %v — requeue with `carryout get -redo %d`", p.Num, err, p.Num)
-			continue
+		if ctx.Err() != nil {
+			return errors.New("interrupted — run `carryout verify` again to finish")
 		}
-		now := time.Now().UTC()
-		st.Update(func() {
-			p.Status = state.Done
-			p.VerifiedAt = now
-			p.LastError = ""
-			if p.ActualSize == 0 {
-				if fi, err := os.Stat(path); err == nil {
-					p.ActualSize = fi.Size()
-				}
-			}
-		})
-		logf("part %03d: verified OK", p.Num)
+		if !fetch.VerifyPartFile(ctx, st, *dir, p, logf) && ctx.Err() == nil {
+			corrupt++
+		}
 	}
 	if corrupt > 0 {
 		return &exitErr{code: 3, err: fmt.Errorf("%d part(s) failed verification", corrupt)}
@@ -565,30 +639,26 @@ func cmdVerify(args []string) error {
 // ---- auth ----
 
 func cmdAuth(args []string) error {
-	fs := flag.NewFlagSet("auth", flag.ExitOnError)
+	fs := flag.NewFlagSet("auth", flag.ContinueOnError)
 	dir := fs.String("dir", ".", "download directory")
 	curlFile := fs.String("curl-file", "", "read the capture from this file instead of prompting")
-	fs.Parse(args)
+	if err := parseFlags(fs, args); err != nil {
+		return err
+	}
 
 	if !state.Exists(*dir) {
 		return fmt.Errorf("no %s in %s — run `carryout init` first", state.FileName, *dir)
 	}
+	release, err := acquireLock(*dir)
+	if err != nil {
+		return err
+	}
+	defer release()
 
-	var text string
-	if *curlFile != "" {
-		b, err := os.ReadFile(*curlFile)
-		if err != nil {
-			return err
-		}
-		text = string(b)
-	} else {
-		fmt.Println("Paste a fresh cURL capture (or just the cookie string), then press Enter on a blank line:")
-		fmt.Println()
-		var err error
-		text, err = readPaste(bufio.NewReader(os.Stdin))
-		if err != nil {
-			return err
-		}
+	text, err := readCapture(bufio.NewReader(os.Stdin), *curlFile,
+		"Paste a fresh cURL capture (or just the cookie string), then press Enter on a blank line:")
+	if err != nil {
+		return err
 	}
 	cookie, err := curlcmd.CookieFromPaste(text)
 	if err != nil {
@@ -602,6 +672,20 @@ func cmdAuth(args []string) error {
 }
 
 // ---- shared helpers ----
+
+// readCapture reads paste-able input from a file or interactively.
+func readCapture(in *bufio.Reader, file, prompt string) (string, error) {
+	if file != "" {
+		b, err := os.ReadFile(file)
+		if err != nil {
+			return "", err
+		}
+		return string(b), nil
+	}
+	fmt.Println(prompt)
+	fmt.Println()
+	return readPaste(in)
+}
 
 func readPaste(r *bufio.Reader) (string, error) {
 	var lines []string
@@ -623,24 +707,6 @@ func readPaste(r *bufio.Reader) (string, error) {
 		return "", errors.New("nothing pasted")
 	}
 	return strings.Join(lines, "\n"), nil
-}
-
-func promptInt(r *bufio.Reader, prompt string) (int, error) {
-	for {
-		fmt.Print(prompt)
-		line, err := r.ReadString('\n')
-		line = strings.TrimSpace(line)
-		if line != "" {
-			n, aerr := strconv.Atoi(line)
-			if aerr == nil && n > 0 {
-				return n, nil
-			}
-			fmt.Println("please enter a positive number")
-		}
-		if err != nil {
-			return 0, errors.New("no part count provided")
-		}
-	}
 }
 
 // parsePartList parses "1,3,7-9" into a set, or nil for the empty string.
@@ -676,43 +742,37 @@ func parsePartList(s string, total int) (map[int]bool, error) {
 
 func acquireLock(dir string) (func(), error) {
 	path := filepath.Join(dir, "carryout.lock")
-	for range 2 {
+	self := []byte(strconv.Itoa(os.Getpid()) + "\n")
+	for range 3 {
 		f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0644)
 		if err == nil {
-			fmt.Fprintf(f, "%d\n", os.Getpid())
+			f.Write(self)
 			f.Close()
-			return func() { os.Remove(path) }, nil
+			release := func() {
+				// only remove a lock that is still ours
+				if b, rerr := os.ReadFile(path); rerr == nil && bytes.Equal(b, self) {
+					os.Remove(path)
+				}
+			}
+			return release, nil
 		}
 		b, rerr := os.ReadFile(path)
 		if rerr != nil {
+			if os.IsNotExist(rerr) {
+				continue // holder released between our O_EXCL and read; retry
+			}
 			return nil, fmt.Errorf("lock file %s exists but is unreadable: %v", path, rerr)
 		}
 		pid, _ := strconv.Atoi(strings.TrimSpace(string(b)))
 		if pid > 0 && processAlive(pid) {
 			return nil, fmt.Errorf("another carryout (pid %d) is already working in this directory", pid)
 		}
-		os.Remove(path) // stale lock from a dead process
+		// Stale lock. Narrow the takeover race: re-check that the lock still
+		// holds the same dead pid before removing it.
+		if b2, rerr := os.ReadFile(path); rerr != nil || !bytes.Equal(b, b2) {
+			continue
+		}
+		os.Remove(path)
 	}
-	return nil, errors.New("could not acquire lock")
-}
-
-func processAlive(pid int) bool {
-	p, err := os.FindProcess(pid)
-	if err != nil {
-		return false
-	}
-	return p.Signal(syscall.Signal(0)) == nil
-}
-
-func humanBytes(n int64) string {
-	const unit = 1024
-	if n < unit {
-		return fmt.Sprintf("%d B", n)
-	}
-	div, exp := int64(unit), 0
-	for m := n / unit; m >= unit; m /= unit {
-		div *= unit
-		exp++
-	}
-	return fmt.Sprintf("%.1f %ciB", float64(n)/float64(div), "KMGTPE"[exp])
+	return nil, errors.New("could not acquire lock (contention); try again")
 }

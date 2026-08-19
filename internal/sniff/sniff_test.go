@@ -7,6 +7,7 @@ import (
 	"archive/zip"
 	"bytes"
 	"compress/gzip"
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
@@ -29,11 +30,17 @@ func TestIsHTML(t *testing.T) {
 	if !IsHTML("text/html; charset=utf-8", []byte("anything")) {
 		t.Error("content-type text/html not detected")
 	}
+	if !IsHTMLContentType("Text/HTML;charset=UTF-8") {
+		t.Error("case/parameter variant not detected")
+	}
 	if !IsHTML("application/octet-stream", []byte("\n  <!DOCTYPE html><html>")) {
 		t.Error("leading < not detected")
 	}
 	if IsHTML("application/octet-stream", []byte{0x1f, 0x8b, 0x08}) {
 		t.Error("gzip misdetected as HTML")
+	}
+	if IsHTMLContentType("application/octet-stream") {
+		t.Error("octet-stream misdetected as HTML content type")
 	}
 }
 
@@ -74,7 +81,7 @@ func TestVerifyGzipOK(t *testing.T) {
 	if err := os.WriteFile(path, gzipBytes(t, tarBuf.Bytes()), 0644); err != nil {
 		t.Fatal(err)
 	}
-	if err := VerifyFile(path); err != nil {
+	if err := VerifyFile(context.Background(), path); err != nil {
 		t.Errorf("VerifyFile = %v, want nil", err)
 	}
 	if k, err := FileKind(path); err != nil || k != "gzip" {
@@ -88,7 +95,7 @@ func TestVerifyTruncatedGzipFails(t *testing.T) {
 	if err := os.WriteFile(path, full[:len(full)-100], 0644); err != nil {
 		t.Fatal(err)
 	}
-	if err := VerifyFile(path); err == nil {
+	if err := VerifyFile(context.Background(), path); err == nil {
 		t.Error("truncated gzip verified OK, want error")
 	}
 }
@@ -100,8 +107,21 @@ func TestVerifyCorruptGzipFails(t *testing.T) {
 	if err := os.WriteFile(path, full, 0644); err != nil {
 		t.Fatal(err)
 	}
-	if err := VerifyFile(path); err == nil {
+	if err := VerifyFile(context.Background(), path); err == nil {
 		t.Error("corrupted gzip verified OK, want error")
+	}
+}
+
+func TestVerifyHonorsContext(t *testing.T) {
+	full := gzipBytes(t, bytes.Repeat([]byte("data"), 50000))
+	path := filepath.Join(t.TempDir(), "c.tgz")
+	if err := os.WriteFile(path, full, 0644); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := VerifyFile(ctx, path); err == nil {
+		t.Error("cancelled verification returned nil")
 	}
 }
 
@@ -118,7 +138,7 @@ func TestVerifyZip(t *testing.T) {
 	if err := os.WriteFile(path, buf.Bytes(), 0644); err != nil {
 		t.Fatal(err)
 	}
-	if err := VerifyFile(path); err != nil {
+	if err := VerifyFile(context.Background(), path); err != nil {
 		t.Errorf("VerifyFile(zip) = %v", err)
 	}
 }
@@ -128,7 +148,51 @@ func TestVerifyGarbageFails(t *testing.T) {
 	if err := os.WriteFile(path, []byte("<html>not an archive</html>"), 0644); err != nil {
 		t.Fatal(err)
 	}
-	if err := VerifyFile(path); err == nil {
+	if err := VerifyFile(context.Background(), path); err == nil {
 		t.Error("garbage verified OK, want error")
 	}
+}
+
+func TestStreamVerifierCleanStream(t *testing.T) {
+	data := gzipBytes(t, bytes.Repeat([]byte("stream me "), 20000))
+	v := NewGzipStreamVerifier()
+	// write in odd-sized chunks like a network copy would
+	for i := 0; i < len(data); i += 3391 {
+		end := min(i+3391, len(data))
+		if _, err := v.Write(data[i:end]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := v.Finish(); err != nil {
+		t.Errorf("Finish = %v, want nil", err)
+	}
+}
+
+func TestStreamVerifierCatchesCorruption(t *testing.T) {
+	data := gzipBytes(t, bytes.Repeat([]byte("stream me "), 20000))
+	data[len(data)/2] ^= 0xff
+	v := NewGzipStreamVerifier()
+	if _, err := v.Write(data); err != nil {
+		t.Fatal(err)
+	}
+	if err := v.Finish(); err == nil {
+		t.Error("corrupted stream verified OK, want error")
+	}
+}
+
+func TestStreamVerifierCatchesTruncation(t *testing.T) {
+	data := gzipBytes(t, bytes.Repeat([]byte("stream me "), 20000))
+	v := NewGzipStreamVerifier()
+	if _, err := v.Write(data[:len(data)-50]); err != nil {
+		t.Fatal(err)
+	}
+	if err := v.Finish(); err == nil {
+		t.Error("truncated stream verified OK, want error")
+	}
+}
+
+func TestStreamVerifierAbortDoesNotBlock(t *testing.T) {
+	v := NewGzipStreamVerifier()
+	v.Write([]byte{0x1f, 0x8b})
+	v.Abort() // must not deadlock
 }
