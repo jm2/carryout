@@ -111,13 +111,17 @@ func partRow(a fetch.ActivePart, speed float64, haveSpeed bool, usable int) stri
 	if haveSpeed {
 		spd = fetch.HumanBytes(int64(speed)) + "/s"
 	}
+	// The current-bytes side is right-aligned in a fixed 10-cell column (the
+	// widest HumanBytes output): a variable-width field here would feed the
+	// flex math a different budget every tick and make the BAR resize as
+	// bytes flow — visible jitter on a static terminal.
 	var frac float64
 	pct := ""
-	sizes := fetch.HumanBytes(a.Cur)
+	sizes := fmt.Sprintf("%10s", fetch.HumanBytes(a.Cur))
 	if a.Expected > 0 {
 		frac = float64(a.Cur) / float64(a.Expected)
 		pct = fmt.Sprintf("%4.0f%%", frac*100)
-		sizes = fetch.HumanBytes(a.Cur) + "/" + fetch.HumanBytes(a.Expected)
+		sizes = fmt.Sprintf("%10s/%s", fetch.HumanBytes(a.Cur), fetch.HumanBytes(a.Expected))
 	}
 
 	build := func(nameW, barW int, withSpeed, withSizes bool) string {
@@ -196,8 +200,10 @@ func aggRow(s fetch.Snapshot, speed float64, haveSpeed bool, usable int) string 
 		spd = fetch.HumanBytes(int64(speed)) + "/s"
 	}
 
+	// Same fixed-width treatment as partRow: the cumulative side must not
+	// re-flex the footer bar as bytes arrive.
 	var frac float64
-	pct, sizes, eta := "", fetch.HumanBytes(cum), ""
+	pct, sizes, eta := "", fmt.Sprintf("%10s", fetch.HumanBytes(cum)), ""
 	wantBar := 0
 	if s.Remaining >= 0 {
 		total := cum + s.Remaining
@@ -206,10 +212,10 @@ func aggRow(s fetch.Snapshot, speed float64, haveSpeed bool, usable int) string 
 			pct = fmt.Sprintf("%4.0f%%", frac*100)
 			wantBar = barMax
 		}
-		sizes = fetch.HumanBytes(cum) + "/" + fetch.HumanBytes(total)
+		sizes = fmt.Sprintf("%10s/%s", fetch.HumanBytes(cum), fetch.HumanBytes(total))
 		if haveSpeed {
 			if e, ok := fetch.ETAString(s.Remaining, speed); ok {
-				eta = "ETA " + e
+				eta = fmt.Sprintf("ETA %9s", e) // padded: width changes would re-flex the bar
 			}
 		}
 	}
