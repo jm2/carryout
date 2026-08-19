@@ -31,6 +31,12 @@ problem. carryout automates the pickup:
 - **Resumes anything.** Interrupted parts resume with validated Range
   requests; a byte-complete `.part` left by a crash is finalized without
   spending another download; re-running `carryout get` is always safe.
+- **Live progress display.** In a terminal, each active download gets a
+  realtime row (bar, %, speed, bytes) above a pinned aggregate footer
+  (parts done, cumulative bytes, speed, ETA), sized to your terminal width.
+  Event lines scroll above; the display pauses cleanly for the cookie
+  prompt. Under nohup/pipes (or with `-plain`) you get classic timestamped
+  logs instead.
 - **Honest bookkeeping.** The `SERVED` counter is seeded from the page's own
   "Number of times already downloaded" and increments the moment Google
   starts serving bytes — it never lags Google's counter, and warns at 4.
@@ -152,6 +158,7 @@ list. The non-obvious ones:
 | `init -curl-file F` / `init -manifest-file F` | Read the capture / file list from files instead of prompting (scripted setup). |
 | `init -parts N` | Skip the file list for simple single-sequence exports only; grouped exports are refused. |
 | `init -force -reuse-capture` | Re-register (e.g. with a corrected file list) reusing the captured URL, headers, and cookies already in the directory — no new browser capture needed. Files already on disk are adopted and re-verified, not re-downloaded. |
+| `get -plain` | Classic timestamped log lines instead of the live progress display (automatic when stdout isn't a terminal). |
 | `get -verify quick` | Skip full decompression checks on clean known-length downloads (magic bytes + size only). Resumed, adopted, and unknown-length parts are always fully verified regardless. |
 | `get -workers / -max-tries / -stall-timeout / -retry-delay` | Tuning; the defaults (3 / 2 / 2m / 30s) are deliberately conservative. |
 | `get -redo N` | Reset a corrupt/failed part and re-download it (deletes its file; spends a download attempt). |
