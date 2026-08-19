@@ -131,6 +131,50 @@ func TestCookieFromPasteCollapsesHardWraps(t *testing.T) {
 	}
 }
 
+func TestCookieFromPasteFindsCurlAfterStrayInput(t *testing.T) {
+	// Regression: keystrokes made while waiting for the prompt sit in the
+	// stdin buffer and land in front of the real capture. The old first-token
+	// check then routed a full Windows capture down the raw-cookie branch,
+	// failing on the User-Agent's "Win64" fragment.
+	paste := "y\nasdf\n" +
+		"curl 'https://takeout-download.usercontent.google.com/download/takeout-x-001.tgz?i=0' \\\n" +
+		"  -H 'cookie: SID=aaa; HSID=bbb' \\\n" +
+		"  -H 'user-agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/126.0' \\\n" +
+		"  --compressed"
+	got, err := CookieFromPaste(paste)
+	if err != nil {
+		t.Fatalf("stray-input capture rejected: %v", err)
+	}
+	if got != "SID=aaa; HSID=bbb" {
+		t.Errorf("cookie = %q", got)
+	}
+}
+
+func TestCookieFromPasteExtractsHeaderFragment(t *testing.T) {
+	// A single -H line (or a couple of header lines) pasted without the curl
+	// prefix must yield just the cookie value, never User-Agent fragments.
+	paste := "-H 'cookie: SID=aaa; HSID=bbb' \\\n" +
+		"-H 'user-agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)' \\"
+	got, err := CookieFromPaste(paste)
+	if err != nil {
+		t.Fatalf("header fragment rejected: %v", err)
+	}
+	if got != "SID=aaa; HSID=bbb" {
+		t.Errorf("cookie = %q", got)
+	}
+}
+
+func TestCookieFromPasteHardWrappedHeaderLine(t *testing.T) {
+	// A plain "Cookie:" header hard-wrapped by an editor keeps all its lines.
+	got, err := CookieFromPaste("Cookie: SID=aaa;\nHSID=bbb;\nSSID=ccc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "SID=aaa; HSID=bbb; SSID=ccc" {
+		t.Errorf("cookie = %q", got)
+	}
+}
+
 func TestCookieFromPasteRejectsPowerShell(t *testing.T) {
 	ps := `Invoke-WebRequest -Uri "https://example.com/x-001.tgz" -Headers @{"cookie"="SID=a"}`
 	if _, err := CookieFromPaste(ps); err == nil || !strings.Contains(err.Error(), "PowerShell") {

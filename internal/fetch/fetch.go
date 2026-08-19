@@ -234,15 +234,19 @@ func (f *Fetcher) refreshAuth(ctx context.Context, seenGen int, reason string) e
 	if seenGen != f.authGen {
 		return nil // another worker already refreshed
 	}
+	// reason is often already "session expired (...)"; don't stutter.
+	if !strings.HasPrefix(reason, "session expired") {
+		reason = "session expired (" + reason + ")"
+	}
 	if f.opt.RefreshAuth == nil {
 		return &fatalError{
-			msg:        "session expired (" + reason + ") — run `carryout auth` with a fresh capture, then `carryout get` to resume",
+			msg:        reason + " — run `carryout auth` with a fresh capture, then `carryout get` to resume",
 			authNeeded: true,
 		}
 	}
 	cookie, err := f.opt.RefreshAuth(ctx, reason)
 	if err != nil {
-		return &fatalError{msg: "session expired (" + reason + "): " + err.Error(), authNeeded: true}
+		return &fatalError{msg: reason + ": " + err.Error(), authNeeded: true}
 	}
 	cookie = strings.TrimSpace(cookie)
 	if cookie == "" {

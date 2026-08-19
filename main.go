@@ -593,19 +593,33 @@ func promptRefreshAuth(ctx context.Context, reason string) (string, error) {
 		text string
 		err  error
 	}
-	ch := make(chan pasteResult, 1)
-	go func() {
-		t, e := readPaste(bufio.NewReader(os.Stdin))
-		ch <- pasteResult{t, e}
-	}()
-	select {
-	case <-ctx.Done():
-		return "", errors.New("interrupted while waiting for cookies — run `carryout auth`, then `carryout get` to resume")
-	case r := <-ch:
-		if r.err != nil {
-			return "", fmt.Errorf("%v — run `carryout auth`, then `carryout get` to resume", r.err)
+	const maxPasteTries = 3
+	for attempt := 1; ; attempt++ {
+		ch := make(chan pasteResult, 1)
+		go func() {
+			t, e := readPaste(bufio.NewReader(os.Stdin))
+			ch <- pasteResult{t, e}
+		}()
+		select {
+		case <-ctx.Done():
+			return "", errors.New("interrupted while waiting for cookies — run `carryout auth`, then `carryout get` to resume")
+		case r := <-ch:
+			pasteErr := r.err
+			if pasteErr == nil {
+				cookie, cerr := curlcmd.CookieFromPaste(r.text)
+				if cerr == nil {
+					return cookie, nil
+				}
+				pasteErr = cerr
+			}
+			// A mangled paste must not kill a multi-hour run: explain and
+			// re-prompt instead of exiting.
+			if attempt >= maxPasteTries {
+				return "", fmt.Errorf("%v — run `carryout auth`, then `carryout get` to resume", pasteErr)
+			}
+			fmt.Printf("\nThat paste didn't work: %v\n", pasteErr)
+			fmt.Printf("Try again (attempt %d/%d), then press Enter on a blank line — or Ctrl-C to abort (state is saved):\n\n", attempt+1, maxPasteTries)
 		}
-		return curlcmd.CookieFromPaste(r.text)
 	}
 }
 

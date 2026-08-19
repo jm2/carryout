@@ -171,7 +171,11 @@ func SanitizeCookie(s string) (string, error) {
 }
 
 // CookieFromPaste extracts a Cookie header value from user input that may be
-// a full cURL command, a "Cookie: ..." header line, or a raw cookie string.
+// a full cURL command, a "Cookie: ..." header line (or an -H 'cookie: …'
+// fragment), or a raw cookie string. A paste made into a busy terminal can
+// arrive with stray input in front of the real payload (keystrokes made while
+// waiting for the prompt), so the payload is located anywhere in the text
+// rather than assumed to start it.
 func CookieFromPaste(s string) (string, error) {
 	s = strings.TrimSpace(s)
 	if s == "" {
@@ -180,8 +184,10 @@ func CookieFromPaste(s string) (string, error) {
 	if low := strings.ToLower(s); strings.Contains(low, "invoke-webrequest") || strings.Contains(low, "invoke-restmethod") || strings.Contains(s, "@{") {
 		return "", errors.New(`this looks like PowerShell output — use "Copy as cURL (bash)", or paste just the cookie string`)
 	}
-	if isCurlWord(strings.Fields(s)[0]) {
-		c, err := Parse(s)
+
+	// A curl command anywhere in the paste wins; leading junk is skipped.
+	if idx := curlStart(s); idx >= 0 {
+		c, err := Parse(s[idx:])
 		if err != nil {
 			return "", err
 		}
@@ -191,10 +197,52 @@ func CookieFromPaste(s string) (string, error) {
 		}
 		return ck, nil // already sanitized by Parse
 	}
-	if len(s) >= 7 && strings.EqualFold(s[:7], "cookie:") {
-		s = strings.TrimSpace(s[7:])
+
+	// A header line anywhere in the paste: "Cookie: …" or "-H 'cookie: …' \".
+	if low := strings.ToLower(s); strings.Contains(low, "cookie:") {
+		rest := s[strings.Index(low, "cookie:")+len("cookie:"):]
+		line, remainder, _ := strings.Cut(rest, "\n")
+		value := line
+		// A hard-wrapped plain header paste continues onto later lines; a
+		// header dump (other -H fragments, a User-Agent) does not belong in
+		// the cookie value.
+		if remainder != "" && !looksLikeHeaderDump(remainder) {
+			value = rest
+		}
+		value = strings.TrimSpace(value)
+		value = strings.TrimSuffix(value, "\\")
+		value = strings.Trim(strings.TrimSpace(value), `'"`)
+		return SanitizeCookie(value)
 	}
+
 	return SanitizeCookie(s)
+}
+
+// curlStart returns the byte offset of the first line whose first word is a
+// curl invocation, or -1.
+func curlStart(s string) int {
+	off := 0
+	for _, line := range strings.SplitAfter(s, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) > 0 && isCurlWord(fields[0]) {
+			return off + strings.Index(line, fields[0])
+		}
+		off += len(line)
+	}
+	return -1
+}
+
+// looksLikeHeaderDump reports whether text appears to be more capture
+// fragments (flag lines, a User-Agent) rather than the continuation of a
+// hard-wrapped cookie value.
+func looksLikeHeaderDump(t string) bool {
+	for _, ln := range strings.Split(t, "\n") {
+		ln = strings.ToLower(strings.TrimSpace(ln))
+		if strings.HasPrefix(ln, "-") || strings.Contains(ln, "mozilla/") || strings.Contains(ln, "user-agent") {
+			return true
+		}
+	}
+	return false
 }
 
 func looksLikeCmdFormat(s string) bool {
