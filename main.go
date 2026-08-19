@@ -31,10 +31,9 @@ import (
 )
 
 // version is the release version, overridden at build time via
-// -ldflags "-X main.version=…" by the release workflow. Nothing has been
-// released yet; the first tag will be v0.1.0 (the internal 0.1/0.2 numbering
-// during initial development shipped to nobody).
-var version = "0.1.0-dev"
+// -ldflags "-X main.version=…" by the release workflow. Between releases it
+// identifies dev builds as a pre-release of the next version.
+var version = "0.3.0-dev"
 
 const usageText = `carryout — picks up your Google Takeout order
 
