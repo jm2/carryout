@@ -1,0 +1,12 @@
+# built binary
+/carryout
+
+# things carryout creates in a download directory (in case someone runs it here)
+carryout.json
+cookies.txt
+carryout.lock
+*.part
+*.error.html
+*.tgz
+*.tar.gz
+*.zip
