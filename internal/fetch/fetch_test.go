@@ -17,6 +17,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/jm2/carryout/internal/sniff"
 	"github.com/jm2/carryout/internal/state"
@@ -753,8 +754,28 @@ func TestETAString(t *testing.T) {
 	if got, ok := ETAString(1000, 100); !ok || got != "10s" {
 		t.Errorf("short ETA = %q, %v (should round to seconds, not minutes)", got, ok)
 	}
-	if got, ok := ETAString(1<<40, 100); !ok || !strings.Contains(got, "days") {
-		t.Errorf("long ETA = %q, %v", got, ok)
+	if got, ok := ETAString(1<<40, 100); !ok || got != ">999 days" {
+		t.Errorf("degenerate ETA = %q, %v (want the >999 days cap)", got, ok)
+	}
+	if got, ok := ETAString(160*86400, 1); !ok || got != "160 days" {
+		t.Errorf("100+ day ETA = %q, %v (want whole days)", got, ok)
+	}
+	if got, ok := ETAString(55*86400, 10); !ok || got != "5.5 days" {
+		t.Errorf("multi-day ETA = %q, %v", got, ok)
+	}
+	// The live footer reserves exactly 9 cells; ETAString must never exceed
+	// it for any input (CodeRabbit finding on the stable-bar-width PR).
+	for _, c := range []struct {
+		remaining int64
+		speed     float64
+	}{
+		{1, 1}, {90, 1}, {3600, 1}, {172799, 1}, {172801, 1},
+		{86400 * 100, 1}, {86400 * 999, 1}, {86400 * 1000, 1}, {1 << 62, 0.001},
+	} {
+		if got, ok := ETAString(c.remaining, c.speed); ok && utf8.RuneCountInString(got) > 9 {
+			t.Errorf("ETAString(%d, %g) = %q: %d cells, exceeds the 9-cell contract",
+				c.remaining, c.speed, got, utf8.RuneCountInString(got))
+		}
 	}
 }
 
