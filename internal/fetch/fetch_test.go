@@ -695,6 +695,69 @@ func TestDryRunTouchesNothing(t *testing.T) {
 	}
 }
 
+func TestSnapshot(t *testing.T) {
+	env := newTestEnv(t, map[int][]byte{}, 3)
+	f := New(env.tmpl, env.st, env.cookie, env.options(t))
+	env.st.Update(func() {
+		env.st.Part(3).Status = state.Done
+		env.st.Part(3).ActualSize = 1000
+		env.st.Part(1).ExpectedSize = 4000
+		env.st.Part(2).ExpectedSize = 2000
+	})
+
+	p1 := f.trackPart(env.st.Part(1), 500, 4000)
+	f.trackPart(env.st.Part(2), 0, 2000)
+	p1.cur.Add(100)
+	f.runBytes.Add(600)
+
+	s := f.Snapshot()
+	if len(s.Active) != 2 || s.Active[0].Num != 1 || s.Active[1].Num != 2 {
+		t.Fatalf("Active = %+v, want parts 1,2 sorted", s.Active)
+	}
+	if s.Active[0].Filename != "x-001.tgz" || s.Active[0].Cur != 600 || s.Active[0].Expected != 4000 {
+		t.Errorf("Active[0] = %+v", s.Active[0])
+	}
+	if s.Done != 1 || s.Total != 3 || s.DoneBytes != 1000 || s.RunBytes != 600 {
+		t.Errorf("counts = %+v", s)
+	}
+	// estimate: 4000 + 2000 pending, minus 600 already on disk in actives
+	if s.Remaining != 5400 {
+		t.Errorf("Remaining = %d, want 5400", s.Remaining)
+	}
+
+	// concurrent tracking must be race-free (run with -race)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for range 200 {
+			f.trackPart(env.st.Part(2), 0, 2000)
+			f.untrackPart(2)
+		}
+	}()
+	for range 200 {
+		_ = f.Snapshot()
+	}
+	<-done
+}
+
+func TestETAString(t *testing.T) {
+	if _, ok := ETAString(0, 100); ok {
+		t.Error("zero remaining should have no ETA")
+	}
+	if _, ok := ETAString(100, 0); ok {
+		t.Error("zero speed should have no ETA")
+	}
+	if got, ok := ETAString(360000, 100); !ok || got != "1h0m0s" {
+		t.Errorf("ETAString = %q, %v", got, ok)
+	}
+	if got, ok := ETAString(1000, 100); !ok || got != "10s" {
+		t.Errorf("short ETA = %q, %v (should round to seconds, not minutes)", got, ok)
+	}
+	if got, ok := ETAString(1<<40, 100); !ok || !strings.Contains(got, "days") {
+		t.Errorf("long ETA = %q, %v", got, ok)
+	}
+}
+
 func TestParseContentRange(t *testing.T) {
 	cases := []struct {
 		in           string

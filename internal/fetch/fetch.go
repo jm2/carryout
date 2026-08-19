@@ -104,6 +104,26 @@ func (s Summary) Complete() bool {
 type partProgress struct {
 	cur      atomic.Int64
 	expected int64
+	filename string
+}
+
+// ActivePart is one in-flight download in a Snapshot.
+type ActivePart struct {
+	Num      int
+	Filename string
+	Cur      int64 // bytes on disk so far (includes any resumed offset)
+	Expected int64 // <= 0 when unknown
+}
+
+// Snapshot is a point-in-time view of the run for progress displays.
+type Snapshot struct {
+	Active     []ActivePart // sorted by part number
+	RunBytes   int64        // bytes transferred this run
+	Done       int
+	Downloaded int
+	Total      int
+	DoneBytes  int64 // on-disk bytes of done + downloaded parts
+	Remaining  int64 // estimated bytes still to download; -1 when unknown
 }
 
 type Fetcher struct {
@@ -811,7 +831,7 @@ func (f *Fetcher) attempt(ctx context.Context, p *state.Part, cookie string) err
 		dst = io.MultiWriter(file, verifier)
 	}
 
-	prog := f.trackPart(p.Num, offset, expected)
+	prog := f.trackPart(p, offset, expected)
 	defer f.untrackPart(p.Num)
 
 	watchStop := make(chan struct{})
@@ -1028,13 +1048,47 @@ func (pr *progressReader) Read(b []byte) (int, error) {
 	return n, err
 }
 
-func (f *Fetcher) trackPart(num int, offset, expected int64) *partProgress {
-	p := &partProgress{expected: expected}
-	p.cur.Store(offset)
+func (f *Fetcher) trackPart(p *state.Part, offset, expected int64) *partProgress {
+	prog := &partProgress{expected: expected, filename: p.Filename}
+	prog.cur.Store(offset)
 	f.progMu.Lock()
-	f.progress[num] = p
+	f.progress[p.Num] = prog
 	f.progMu.Unlock()
-	return p
+	return prog
+}
+
+// Snapshot returns a point-in-time view of the run for progress displays.
+// Lock order: progMu is released before the state lock is taken — the same
+// discipline report() and eta() follow.
+func (f *Fetcher) Snapshot() Snapshot {
+	f.progMu.Lock()
+	active := make([]ActivePart, 0, len(f.progress))
+	for num, p := range f.progress {
+		active = append(active, ActivePart{Num: num, Filename: p.filename, Cur: p.cur.Load(), Expected: p.expected})
+	}
+	f.progMu.Unlock()
+	sort.Slice(active, func(i, j int) bool { return active[i].Num < active[j].Num })
+
+	_, downloaded, done, _, _, doneBytes := f.st.Counts()
+	snap := Snapshot{
+		Active:     active,
+		RunBytes:   f.runBytes.Load(),
+		Done:       done,
+		Downloaded: downloaded,
+		Total:      f.st.TotalParts,
+		DoneBytes:  doneBytes,
+		Remaining:  -1,
+	}
+	if remaining, ok := f.st.RemainingEstimate(); ok {
+		for _, a := range active {
+			remaining -= a.Cur
+		}
+		if remaining < 0 {
+			remaining = 0
+		}
+		snap.Remaining = remaining
+	}
+	return snap
 }
 
 func (f *Fetcher) untrackPart(num int) {
@@ -1110,12 +1164,25 @@ func (f *Fetcher) eta(speed float64) (string, bool) {
 		remaining -= p.cur.Load()
 	}
 	f.progMu.Unlock()
-	if remaining <= 0 {
+	return ETAString(remaining, speed)
+}
+
+// ETAString formats an estimated time remaining for `remaining` bytes at
+// `speed` bytes/second. Shared by the plain progress line and the live
+// display so the two can't drift.
+func ETAString(remaining int64, speed float64) (string, bool) {
+	if remaining <= 0 || speed <= 0 {
 		return "", false
 	}
-	d := time.Duration(float64(remaining)/speed) * time.Second
-	if d > 48*time.Hour {
-		return fmt.Sprintf("%.1f days", d.Hours()/24), true
+	// Work in float seconds: converting terabytes-at-a-crawl straight into a
+	// time.Duration overflows int64 nanoseconds and goes negative.
+	secs := float64(remaining) / speed
+	if secs > 48*3600 {
+		return fmt.Sprintf("%.1f days", secs/86400), true
+	}
+	d := time.Duration(secs * float64(time.Second))
+	if d < 2*time.Minute {
+		return d.Round(time.Second).String(), true
 	}
 	return d.Round(time.Minute).String(), true
 }

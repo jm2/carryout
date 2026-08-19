@@ -12,7 +12,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -20,7 +19,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"syscall"
 	"text/tabwriter"
 	"time"
@@ -29,6 +27,7 @@ import (
 	"github.com/jm2/carryout/internal/fetch"
 	"github.com/jm2/carryout/internal/state"
 	"github.com/jm2/carryout/internal/takeout"
+	"github.com/jm2/carryout/internal/ui"
 )
 
 // version is the release version, overridden at build time via
@@ -129,65 +128,9 @@ func parseFlags(fs *flag.FlagSet, args []string) error {
 	return nil
 }
 
-// logGate serializes log output with the interactive cookie prompt. Fatal
-// and auth events deliberately let in-flight transfers finish in the
-// background, so with several workers their completion lines (and the
-// periodic progress ticks) would otherwise land in the middle of the paste
-// screen. While held, event lines are buffered and replayed after the
-// prompt; progress ticks are dropped — they're stale within seconds.
-type logGate struct {
-	mu   sync.Mutex
-	out  io.Writer
-	held bool
-	buf  []string
-}
-
-func stampLine(format string, args ...any) string {
-	return time.Now().Format("15:04:05") + "  " + fmt.Sprintf(format, args...)
-}
-
-func (g *logGate) Logf(format string, args ...any) {
-	line := stampLine(format, args...)
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	if g.held {
-		g.buf = append(g.buf, line)
-		return
-	}
-	fmt.Fprintln(g.out, line)
-}
-
-func (g *logGate) Progressf(format string, args ...any) {
-	line := stampLine(format, args...)
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	if g.held {
-		return
-	}
-	fmt.Fprintln(g.out, line)
-}
-
-func (g *logGate) Hold() {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	g.held = true
-}
-
-func (g *logGate) Release() {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	g.held = false
-	if len(g.buf) == 0 {
-		return
-	}
-	fmt.Fprintf(g.out, "\n(%d log line(s) arrived while the prompt was up)\n", len(g.buf))
-	for _, l := range g.buf {
-		fmt.Fprintln(g.out, l)
-	}
-	g.buf = nil
-}
-
-var gate = &logGate{out: os.Stdout}
+// gate is the process-wide console: Plain timestamped logs by default,
+// swapped for the live renderer in cmdGet when stdout is a real terminal.
+var gate ui.Console = ui.NewPlain(os.Stdout)
 
 func logf(format string, args ...any) { gate.Logf(format, args...) }
 
@@ -412,6 +355,7 @@ func cmdGet(args []string) error {
 	only := fs.String("only", "", "limit to these parts, e.g. \"1\" or \"3,7-9\"")
 	redo := fs.String("redo", "", "reset these parts and re-download them (deletes their files; costs an attempt)")
 	dryRun := fs.Bool("dry-run", false, "print what would be fetched without touching the network or state")
+	plain := fs.Bool("plain", false, "plain timestamped log output (no live progress display)")
 	noPrompt := fs.Bool("no-prompt", false, "never prompt for cookies; exit 2 when the session dies")
 	stall := fs.Duration("stall-timeout", 2*time.Minute, "abort an attempt when no data arrives for this long")
 	retryDelay := fs.Duration("retry-delay", 30*time.Second, "wait between retries of a failed part")
@@ -458,6 +402,17 @@ func cmdGet(args []string) error {
 		defer release()
 	}
 
+	// Live progress display when stdout is a real terminal; today's plain
+	// logs otherwise (nohup, pipes, -plain, dry runs).
+	var live *ui.Renderer
+	if !*plain && !*dryRun {
+		if r, ok := ui.NewLive(os.Stdout, isTTY(os.Stdout)); ok {
+			live = r
+			gate = r
+			defer r.Close()
+		}
+	}
+
 	if len(redoSet) > 0 {
 		if err := applyRedo(st, *dir, redoSet, *dryRun); err != nil {
 			return err
@@ -483,12 +438,18 @@ func cmdGet(args []string) error {
 	}
 
 	f := fetch.New(tmpl, st, cookie, opts)
+	if live != nil {
+		live.Start(f.Snapshot)
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	go func() { <-ctx.Done(); stop() }() // a second Ctrl-C kills the process immediately
 
 	sum, runErr := f.Run(ctx)
+	if live != nil {
+		live.Close() // idempotent; the summary below prints on a clean screen
+	}
 
 	if !*dryRun {
 		fmt.Println()

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-package main
+package ui
 
 import (
 	"bytes"
@@ -8,9 +8,9 @@ import (
 	"testing"
 )
 
-func TestLogGateHoldsEventsAndDropsProgressDuringPrompt(t *testing.T) {
+func TestPlainHoldsEventsAndDropsProgressDuringPrompt(t *testing.T) {
 	var out bytes.Buffer
-	g := &logGate{out: &out}
+	g := NewPlain(&out)
 
 	g.Logf("before prompt")
 	g.Hold()
@@ -35,15 +35,14 @@ func TestLogGateHoldsEventsAndDropsProgressDuringPrompt(t *testing.T) {
 	if strings.Contains(got, "part 043") {
 		t.Errorf("progress tick should have been dropped:\n%s", got)
 	}
-	// the replayed event must land after the release point, not mid-prompt
 	if strings.Index(got, "part 042") < strings.Index(got, "before prompt") {
 		t.Errorf("replay ordering wrong:\n%s", got)
 	}
 }
 
-func TestLogGateReleaseWithoutBufferIsSilent(t *testing.T) {
+func TestPlainReleaseWithoutBufferIsSilent(t *testing.T) {
 	var out bytes.Buffer
-	g := &logGate{out: &out}
+	g := NewPlain(&out)
 	g.Hold()
 	g.Release()
 	if out.Len() != 0 {
