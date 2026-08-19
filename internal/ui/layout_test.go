@@ -79,6 +79,50 @@ func TestFlexOrderBarThenNameThenExtras(t *testing.T) {
 	}
 }
 
+func TestBarWidthStableAsBytesFlow(t *testing.T) {
+	// Regression (user-reported): on a static terminal, the bar visibly
+	// resized between 0-2% — dropping to nothing and reappearing as a sliver
+	// — because the variable-width downloaded/total field re-flexed the bar
+	// as byte counts churned through different HumanBytes widths. The bar
+	// width and the total row width must be pure functions of the terminal
+	// width, never of the byte count.
+	exp := int64(50) << 30
+	curs := []int64{0, 1, 500 << 10, 1 << 20, 999 << 20, 10 << 30, exp}
+	for _, w := range []int{160, 120, 90, 80, 72, 60, 50} {
+		usable := w - 1
+		var bars, lens []int
+		for _, cur := range curs {
+			a := fetch.ActivePart{Num: 7, Filename: "takeout-20260818T182058Z-2-014.tgz", Cur: cur, Expected: exp}
+			row := partRow(a, 100e6, true, usable)
+			bars = append(bars, strings.Count(row, "█")+strings.Count(row, "░"))
+			lens = append(lens, cells(row))
+		}
+		for i := 1; i < len(curs); i++ {
+			if bars[i] != bars[0] {
+				t.Errorf("w=%d: bar resized as bytes flowed: cur=%d → %d cells (was %d)", w, curs[i], bars[i], bars[0])
+			}
+			if lens[i] != lens[0] {
+				t.Errorf("w=%d: row width changed as bytes flowed: cur=%d → %d cells (was %d)", w, curs[i], lens[i], lens[0])
+			}
+		}
+	}
+
+	// footer: cumulative bytes churn with a fixed grand total
+	total := int64(7) << 40
+	var bars, lens []int
+	for _, cum := range []int64{0, 1 << 20, 500 << 30, total / 2, total - 1} {
+		s := fetch.Snapshot{Done: 3, Total: 142, DoneBytes: cum, Remaining: total - cum}
+		row := aggRow(s, 600e6, true, 119)
+		bars = append(bars, strings.Count(row, "█")+strings.Count(row, "░"))
+		lens = append(lens, cells(row))
+	}
+	for i := 1; i < len(bars); i++ {
+		if bars[i] != bars[0] || lens[i] != lens[0] {
+			t.Errorf("footer jitter: bars=%v lens=%v", bars, lens)
+		}
+	}
+}
+
 func TestEllipsizeKeepsDistinguishingTail(t *testing.T) {
 	name := "takeout-20260818T182058Z-2-014.tgz"
 	got := ellipsize(name, 20)
