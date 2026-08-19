@@ -93,6 +93,8 @@ with a command allocates no pty, so nothing truncates):
 ```sh
 Get-Clipboard | ssh you@host "cat > /path/to/export/manifest.txt"  # Windows PowerShell
 pbpaste | ssh you@host "cat > /path/to/export/manifest.txt"        # macOS
+wl-paste | ssh you@host "cat > /path/to/export/manifest.txt"       # Linux (Wayland)
+xclip -o -selection clipboard | ssh you@host "cat > /path/to/export/manifest.txt"  # Linux (X11)
 ```
 
 (Pasting inside `nano`/`vim` over SSH also works — editors run the terminal
