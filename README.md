@@ -110,6 +110,21 @@ carryout status     # per-part table: file, status, sizes, serve count
 carryout verify     # (re)verify anything not yet fully verified
 ```
 
+## Flags worth knowing
+
+Every command takes `-dir` (default: current directory) and `-h` for the full
+list. The non-obvious ones:
+
+| Flag | What |
+|---|---|
+| `init -curl-file F` / `init -manifest-file F` | Read the capture / file list from files instead of prompting (scripted setup). |
+| `init -parts N` | Skip the file list for simple single-sequence exports only; grouped exports are refused. |
+| `get -verify quick` | Skip full decompression checks on clean known-length downloads (magic bytes + size only). Resumed, adopted, and unknown-length parts are always fully verified regardless. |
+| `get -workers / -max-tries / -stall-timeout / -retry-delay` | Tuning; the defaults (3 / 2 / 2m / 30s) are deliberately conservative. |
+| `get -redo N` | Reset a corrupt/failed part and re-download it (deletes its file; spends a download attempt). |
+| `status -v` | Include completed parts in the table. |
+| `verify -all` | Re-verify everything on disk, even already-verified parts. |
+
 ## Account safety
 
 Designed so the answer to "will this endanger my Google account?" is no:
