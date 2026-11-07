@@ -44,11 +44,33 @@ problem. carryout automates the pickup:
 
 ## Install
 
+Release packages are on the [releases page](https://github.com/jm2/carryout/releases):
+
 ```sh
-go install github.com/jm2/carryout@latest
-# or, from a checkout:
-go build -o carryout .
+sudo dnf install ./carryout-x86_64.rpm            # Fedora (or: dnf copr enable jmsqrd/carryout)
+sudo apt install ./carryout-amd64.deb             # Debian, Ubuntu
+sudo pacman -U carryout-x86_64.pkg.tar.zst        # Arch (or the AUR's carryout-bin)
+go install github.com/jm2/carryout@latest         # anywhere
 ```
+
+The packages (`x86_64`/`aarch64` rpm, `amd64`/`arm64` deb, `x86_64` Arch)
+install `/usr/bin/carryout` and the README; there are no services or config
+files. For macOS, Windows, and other Linux systems, the release's
+`carryout_<version>_<os>_<arch>` archives hold the bare binary, and
+`SHA256SUMS.txt` covers every asset.
+
+From a checkout:
+
+```sh
+make build                     # ./carryout
+make cross                     # dist/carryout-<os>-<arch> for every release target
+make cross deb ARCH=amd64      # dist/carryout-amd64.deb (needs dpkg-deb)
+cp build-aux/arch/PKGBUILD . && CARRYOUT_VERSION=v0.3.0 makepkg -sf   # Arch
+```
+
+The RPM spec (`build-aux/rpm/carryout.spec`) is the one COPR builds through
+Packit (`.packit.yaml`); `build-aux/arch/carryout-bin/` is the AUR `-bin`
+package, which repackages the release `.deb`s.
 
 ## Walkthrough
 

@@ -148,3 +148,32 @@ jobs:
             GOOS="${target%/*}" GOARCH="${target#*/}" CGO_ENABLED=0 go build ./...
             echo "ok ${target}"
           done
+
+  # ── Linux package (deb) ────────────────────────────────────────────────────
+  # The release builds its .debs with these Makefile targets and scripts;
+  # build one and install it so packaging breaks here, not on release day.
+  package:
+    name: Package (deb)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+          check-latest: true
+          cache: false
+
+      - name: Build the .deb
+        run: |
+          make cross VERSION=0.0.0-ci
+          make deb ARCH=amd64 VERSION=0.0.0-ci
+
+      - name: Install it and run it
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y ./dist/carryout-amd64.deb
+          [[ "$(carryout version)" == "carryout 0.0.0-ci" ]]
+          carryout help >/dev/null
