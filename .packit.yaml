@@ -1,0 +1,29 @@
+# See the documentation for more information:
+# https://packit.dev/docs/configuration/
+
+specfile_path: build-aux/rpm/carryout.spec
+
+files_to_sync:
+  - build-aux/rpm/carryout.spec
+  - .packit.yaml
+
+upstream_package_name: carryout
+# Release tags are v-prefixed, but RPM versions must be bare: rpmvercmp ranks
+# every "v"-prefixed version below any bare one.
+upstream_tag_template: "v{version}"
+downstream_package_name: carryout
+upstream_project_url: https://github.com/jm2/carryout
+# carryout has no module dependencies; the network is only for the Go
+# toolchain go.mod names when Fedora's is older.
+enable_net: true
+
+jobs:
+  - job: copr_build
+    trigger: release
+    owner: jmsqrd
+    project: carryout
+    targets:
+      - fedora-44-x86_64
+      - fedora-44-aarch64
+      - fedora-45-x86_64
+      - fedora-45-aarch64

@@ -1,0 +1,27 @@
+# Maintainer: carryout contributors <https://github.com/jm2/carryout>
+#
+# AUR package: the prebuilt release, repackaged from the release's .deb
+# files (one static Go binary and its README). To update: set pkgver, run
+# `updpkgsums` and `makepkg --printsrcinfo > .SRCINFO`, and check the sums
+# against the release's SHA256SUMS.txt.
+pkgname=carryout-bin
+pkgver=0.3.0
+pkgrel=1
+pkgdesc="Download helper for Google Takeout"
+arch=('x86_64' 'aarch64')
+url="https://github.com/jm2/carryout"
+license=('GPL-3.0-or-later')
+provides=('carryout')
+conflicts=('carryout')
+depends=()
+options=('!strip' '!debug')
+source_x86_64=("carryout-$pkgver-amd64.deb::$url/releases/download/v$pkgver/carryout-amd64.deb")
+source_aarch64=("carryout-$pkgver-arm64.deb::$url/releases/download/v$pkgver/carryout-arm64.deb")
+sha256sums_x86_64=('0000000000000000000000000000000000000000000000000000000000000000')
+sha256sums_aarch64=('0000000000000000000000000000000000000000000000000000000000000000')
+
+package() {
+  bsdtar -xf data.tar.* -C "$pkgdir"
+  # Arch keeps license texts in the licenses package; GPL-3.0 is there.
+  rm -rf "$pkgdir/usr/share/lintian" "$pkgdir/usr/share/doc/carryout/changelog.gz" "$pkgdir/usr/share/doc/carryout/copyright"
+}

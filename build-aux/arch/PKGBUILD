@@ -1,0 +1,43 @@
+# Maintainer: carryout contributors <https://github.com/jm2/carryout>
+#
+# Builds the carryout checkout it is copied into. The AUR packages are
+# maintained separately (build-aux/arch/carryout-bin/ is the -bin one).
+# From the repository root:
+#   cp build-aux/arch/PKGBUILD . && CARRYOUT_VERSION=v0.3.0 makepkg -sf
+pkgname=carryout
+# The release workflow passes the tag (CARRYOUT_VERSION=v0.3.0-rc.1).
+# pkgver can't hold "-", and "0.3.0rc.1" sorts before "0.3.0" as it should.
+_tag=${CARRYOUT_VERSION:-v0.3.0}
+_version=${_tag#v}
+pkgver=${_version//-/}
+pkgrel=1
+pkgdesc="Download helper for Google Takeout"
+arch=('x86_64' 'aarch64')
+url="https://github.com/jm2/carryout"
+license=('GPL-3.0-or-later')
+options=('!lto' '!debug' '!strip')
+depends=()
+makedepends=('go' 'make')
+source=()
+
+build() {
+  cd "$startdir"
+  # go.mod names the Go release to build with; fetch it if the system Go is
+  # older.
+  export GOTOOLCHAIN="${GOTOOLCHAIN:-auto}" GOFLAGS="${GOFLAGS:+$GOFLAGS }-mod=readonly"
+  make build VERSION="$_version"
+}
+
+check() {
+  cd "$startdir"
+  ./carryout version | grep -Fx "carryout $_version"
+}
+
+package() {
+  cd "$startdir"
+  mkdir -p bin-stage
+  cp carryout bin-stage/
+  build-aux/linux/install-tree.sh "$pkgdir" bin-stage /usr
+  rm -rf bin-stage
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

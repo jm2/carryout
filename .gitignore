@@ -10,3 +10,11 @@ carryout.lock
 *.tgz
 *.tar.gz
 *.zip
+
+# make cross / make deb output, and an in-tree makepkg run
+/dist/
+/src/
+/pkg/
+/bin-stage/
+/PKGBUILD
+*.pkg.tar.zst

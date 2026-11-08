@@ -61,9 +61,9 @@ jobs:
         run: |
           echo "build_ref=$(git rev-parse HEAD)" >> "${GITHUB_OUTPUT}"
 
-  # ── Build all six platform archives from the resolved SHA ─────────────────
+  # ── Build all six platform archives and the .debs from the resolved SHA ──
   build:
-    name: Build release archives
+    name: Build release archives and .deb
     needs: prepare
     runs-on: ubuntu-24.04
     permissions:
@@ -87,56 +87,203 @@ jobs:
           go vet ./...
           go test ./...
 
-      - name: Build and package all targets
+      - name: Build every release target
         env:
           VERSION: ${{ needs.prepare.outputs.version }}
-        run: |
-          set -euo pipefail
-          mkdir -p dist
-          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64; do
-            goos="${target%/*}"
-            goarch="${target#*/}"
-            bin="carryout"
-            [[ "${goos}" == "windows" ]] && bin="carryout.exe"
-
-            stage="$(mktemp -d)"
-            GOOS="${goos}" GOARCH="${goarch}" CGO_ENABLED=0 \
-              go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" \
-              -o "${stage}/${bin}" .
-            cp README.md LICENSE "${stage}/"
-
-            base="carryout_${VERSION}_${goos}_${goarch}"
-            if [[ "${goos}" == "windows" ]]; then
-              (cd "${stage}" && zip -q -X "${GITHUB_WORKSPACE}/dist/${base}.zip" "${bin}" README.md LICENSE)
-            else
-              tar --owner=0 --group=0 --numeric-owner \
-                -czf "dist/${base}.tar.gz" -C "${stage}" "${bin}" README.md LICENSE
-            fi
-            rm -rf "${stage}"
-            echo "packaged ${base}"
-          done
+        run: make cross VERSION="${VERSION}"
 
       - name: Smoke-test the native binary reports the release version
         env:
           VERSION: ${{ needs.prepare.outputs.version }}
         run: |
           set -euo pipefail
-          tar -xzf "dist/carryout_${VERSION}_linux_amd64.tar.gz" -C "${RUNNER_TEMP}" carryout
-          got="$("${RUNNER_TEMP}/carryout" version)"
+          got="$(dist/carryout-linux-amd64 version)"
           echo "${got}"
           [[ "${got}" == "carryout ${VERSION}" ]]
 
-      - name: Upload release archives
+      # The archive names predate the Linux packages; keep them so existing
+      # download links and scripts go on working.
+      - name: Package archives
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64; do
+            goos="${target%/*}"
+            goarch="${target#*/}"
+            bin="carryout"
+            ext=""
+            [[ "${goos}" == "windows" ]] && bin="carryout.exe" && ext=".exe"
+
+            stage="$(mktemp -d)"
+            cp "dist/carryout-${goos}-${goarch}${ext}" "${stage}/${bin}"
+            cp README.md LICENSE "${stage}/"
+
+            base="carryout_${VERSION}_${goos}_${goarch}"
+            if [[ "${goos}" == "windows" ]]; then
+              (cd "${stage}" && zip -q -X "${GITHUB_WORKSPACE}/release/${base}.zip" "${bin}" README.md LICENSE)
+            else
+              tar --owner=0 --group=0 --numeric-owner \
+                -czf "release/${base}.tar.gz" -C "${stage}" "${bin}" README.md LICENSE
+            fi
+            rm -rf "${stage}"
+            echo "packaged ${base}"
+          done
+
+      - name: Build .deb packages
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          for arch in amd64 arm64; do
+            make deb ARCH="${arch}" VERSION="${VERSION}"
+            cp "dist/carryout-${arch}.deb" release/
+          done
+
+      - name: Install and check the amd64 .deb
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y ./release/carryout-amd64.deb
+          got="$(carryout version)"
+          echo "${got}"
+          [[ "${got}" == "carryout ${VERSION}" ]]
+          carryout help >/dev/null
+
+      - name: Upload release archives and .debs
         uses: actions/upload-artifact@v7
         with:
           name: carryout-release-archives
-          path: dist/
+          path: release/
+          if-no-files-found: error
+
+  # ── .rpm: the same spec COPR builds, from the resolved SHA, on Fedora ──────
+  rpm:
+    name: RPM (${{ matrix.arch }})
+    needs: prepare
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    container:
+      image: registry.fedoraproject.org/fedora:44
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: Install build dependencies
+        run: dnf install -y --setopt=install_weak_deps=False git-core golang make rpm-build
+
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.prepare.outputs.build_ref }}
+          persist-credentials: false
+
+      - name: Build the .rpm
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory "${GITHUB_WORKSPACE}"
+          # RPM sorts "~" before anything, so 1.0.0~rc.1 precedes 1.0.0.
+          rpmver="${VERSION//-/\~}"
+          top="${PWD}/rpmbuild"
+          mkdir -p "${top}/SOURCES" "${top}/SPECS"
+          git archive --format=tar.gz --prefix="carryout-${rpmver}/" -o "${top}/SOURCES/v${rpmver}.tar.gz" HEAD
+          sed "s/^Version:.*/Version:        ${rpmver}/" build-aux/rpm/carryout.spec > "${top}/SPECS/carryout.spec"
+          # carryout_version stamps the binary with the real version
+          # (0.3.0-rc.1, not 0.3.0~rc.1).
+          rpmbuild --define "_topdir ${top}" --define "carryout_version ${VERSION}" -bb "${top}/SPECS/carryout.spec"
+          mkdir -p out
+          cp "${top}"/RPMS/*/carryout-*.rpm "out/carryout-${ARCH}.rpm"
+          rpm -qip "out/carryout-${ARCH}.rpm"
+          rpm -qlp "out/carryout-${ARCH}.rpm"
+
+      - name: Install and check the .rpm
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          dnf install -y "./out/carryout-${ARCH}.rpm"
+          got="$(carryout version)"
+          echo "${got}"
+          [[ "${got}" == "carryout ${VERSION}" ]]
+          carryout help >/dev/null
+
+      - name: Upload the .rpm
+        uses: actions/upload-artifact@v7
+        with:
+          name: rpm-${{ matrix.arch }}
+          path: out/carryout-${{ matrix.arch }}.rpm
+          if-no-files-found: error
+
+  # ── Arch Linux package (x86_64) from the in-repo PKGBUILD ──────────────────
+  arch:
+    name: Arch Linux package (x86_64)
+    needs: prepare
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    container:
+      image: archlinux:base-devel
+    steps:
+      - name: Install build dependencies
+        run: pacman -Syu --noconfirm git go
+
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.prepare.outputs.build_ref }}
+          persist-credentials: false
+
+      - name: Build the package
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # makepkg refuses to run as root.
+          useradd -m builder
+          cp -r . /home/builder/carryout
+          cp build-aux/arch/PKGBUILD /home/builder/carryout/PKGBUILD
+          chown -R builder:builder /home/builder/carryout
+          su builder -c "cd /home/builder/carryout && CARRYOUT_VERSION='${TAG}' makepkg -f --noconfirm"
+          pkg="$(su builder -c "cd /home/builder/carryout && CARRYOUT_VERSION='${TAG}' makepkg --packagelist")"
+          if [[ -z "${pkg}" || "${pkg}" == *$'\n'* || ! -f "${pkg}" ]]; then
+            echo "Expected exactly one built package; makepkg lists: ${pkg}" >&2
+            exit 1
+          fi
+          mkdir -p out
+          cp "${pkg}" out/carryout-x86_64.pkg.tar.zst
+          bsdtar -tf out/carryout-x86_64.pkg.tar.zst
+
+      - name: Install and check the package
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          pacman -U --noconfirm out/carryout-x86_64.pkg.tar.zst
+          got="$(carryout version)"
+          echo "${got}"
+          [[ "${got}" == "carryout ${VERSION}" ]]
+          carryout help >/dev/null
+
+      - name: Upload the package
+        uses: actions/upload-artifact@v7
+        with:
+          name: arch-x86_64
+          path: out/carryout-x86_64.pkg.tar.zst
           if-no-files-found: error
 
   # ── SHA256 checksums over the exact expected asset set ────────────────────
   checksums:
     name: SHA256 Checksums
-    needs: [prepare, build]
+    needs: [prepare, build, rpm, arch]
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -159,6 +306,11 @@ jobs:
             "carryout_${VERSION}_linux_arm64.tar.gz"
             "carryout_${VERSION}_windows_amd64.zip"
             "carryout_${VERSION}_windows_arm64.zip"
+            carryout-amd64.deb
+            carryout-arm64.deb
+            carryout-x86_64.rpm
+            carryout-aarch64.rpm
+            carryout-x86_64.pkg.tar.zst
           )
           declare -A release_paths=()
           while IFS= read -r -d '' path; do
@@ -168,7 +320,7 @@ jobs:
               exit 1
             fi
             release_paths["$name"]="$path"
-          done < <(find . -type f \( -name '*.tar.gz' -o -name '*.zip' \) -print0)
+          done < <(find . -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.deb' -o -name '*.rpm' -o -name '*.pkg.tar.zst' \) -print0)
 
           if (( ${#release_paths[@]} != ${#expected_assets[@]} )); then
             echo "Expected ${#expected_assets[@]} unique release assets; found ${#release_paths[@]}" >&2
@@ -222,4 +374,7 @@ jobs:
           files: |
             release-assets/*.tar.gz
             release-assets/*.zip
+            release-assets/*.deb
+            release-assets/*.rpm
+            release-assets/*.pkg.tar.zst
             release-assets/SHA256SUMS.txt
